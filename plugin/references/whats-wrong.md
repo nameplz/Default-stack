@@ -8,7 +8,7 @@ Inputs: `vision.md`, `decisions.md` and other existing docs (see `docs-conventio
 
 1. Size the research to the project. A small feature needs a light check of the existing code, docs and a source or two. A larger or unfamiliar problem needs deep research.
 2. Before researching, list the items the research must cover (for example existing solutions, constraints, candidate libraries, known pitfalls).
-3. Research and save findings with sources to `research/<topic>.md`. Don't save trivial results.
+3. Research and always save the findings with sources to `research/<topic>.md`, even when the research was light. Keep the doc as short as the research was.
 
 ## 2. Problem
 
