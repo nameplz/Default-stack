@@ -25,7 +25,7 @@ Only when the user ends the chat or asks for a write-up.
    | Open | A question not yet answered |
    | Discarded | Discussed and not chosen |
 
-   Never mark something Confirmed that the user did not explicitly choose.
+   Confirmed means the user said it. Anything you inferred, however likely, is a Candidate until the user confirms it, even if you flag it as an assumption.
 2. Write or update docs following `docs-convention.md`:
    - `vision.md`: purpose, the idea, candidates, open questions
    - `decisions.md`: confirmed decisions with rationale, discarded directions with the reason

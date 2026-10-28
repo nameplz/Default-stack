@@ -2,7 +2,7 @@
 
 Implement the plan's Steps one at a time with TDD, writing only the code that is needed.
 
-Inputs: `work/<topic>/plan.md`, `problem.md`, `decisions.md` (see `docs-convention.md`). If an is-it-ok report has must-fix items, fix those first.
+Inputs: `work/<topic>/plan.md`, `problem.md`, `decisions.md` (see `docs-convention.md`). If an is-it-ok report has must-fix items, fix those first. Fix optional items only when the user asks.
 
 ## Each Step
 
