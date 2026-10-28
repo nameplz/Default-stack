@@ -1,0 +1,14 @@
+{
+  "name": "default-stack",
+  "description": "Default-stack: idea-to-implementation harness",
+  "owner": {
+    "name": "nameplz"
+  },
+  "plugins": [
+    {
+      "name": "default-stack",
+      "source": "./plugin",
+      "description": "A light harness that takes a vague idea from casual chat to a verified implementation."
+    }
+  ]
+}

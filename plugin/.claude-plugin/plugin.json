@@ -1,0 +1,7 @@
+{
+  "name": "default-stack",
+  "version": "0.1.0",
+  "description": "A light harness that takes a vague idea from casual chat to a verified implementation.",
+  "author": { "name": "nameplz" },
+  "license": "MIT"
+}

@@ -1,0 +1,12 @@
+{
+  "name": "default-stack",
+  "interface": { "displayName": "Default-stack" },
+  "plugins": [
+    {
+      "name": "default-stack",
+      "source": { "source": "local", "path": "./plugin" },
+      "policy": { "installation": "AVAILABLE" },
+      "category": "Productivity"
+    }
+  ]
+}
