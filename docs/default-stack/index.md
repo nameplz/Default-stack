@@ -6,14 +6,14 @@
 | [decisions.md](decisions.md) | 확정 결정과 근거, 미결정 사항 |
 | [work/plugin-structure.md](work/plugin-structure.md) | 디렉터리 구조, `references/` 설계, 문서 저장 규칙 |
 | [work/skills/coffee-chat.md](work/skills/coffee-chat.md) | 느슨한 대화로 아이디어 구체화 |
-| [work/skills/whats-wrong.md](work/skills/whats-wrong.md) | 리서치 + 문제 정의 + Phase/Step 분할 |
-| [work/skills/shall-we.md](work/skills/shall-we.md) | TDD 기반 최소 구현 |
-| [work/skills/is-it-ok.md](work/skills/is-it-ok.md) | 독립 세션 검증 |
-| [work/skills/just-do-it.md](work/skills/just-do-it.md) | 전체 흐름 연속 실행 |
+| [work/skills/apply-stack.md](work/skills/apply-stack.md) | 저장소 검증 기반 설정 (verify, CI, 검증 스킬, 자동 병합) |
+| [work/skills/ship-it.md](work/skills/ship-it.md) | PR 전달과 필수 검사 기반 자동 병합 |
+| [work/skills/formal.md](work/skills/formal.md) | 형식 검증 생성·유지, verify·CI 연결 |
+| [work/skills/explore.md](work/skills/explore.md) | 릴리스별 앱 탐색과 버그별 수정 PR |
 
 ## 흐름
 
 ```
-coffee-chat → whats-wrong → shall-we ⇄ is-it-ok
-└──────────────── just-do-it ────────────────┘
+coffee-chat
+apply-stack → ship-it ← formal, explore
 ```

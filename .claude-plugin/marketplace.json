@@ -1,6 +1,6 @@
 {
   "name": "default-stack",
-  "description": "Default-stack: idea-to-implementation harness",
+  "description": "Default-stack: idea chat and verify-gated delivery",
   "owner": {
     "name": "nameplz"
   },
@@ -8,7 +8,7 @@
     {
       "name": "default-stack",
       "source": "./plugin",
-      "description": "A light harness that takes a vague idea from casual chat to a verified implementation."
+      "description": "Shape a vague idea in casual chat, then set repositories up so checks, not instructions, hold agents to the work and changes auto-merge once verify passes."
     }
   ]
 }

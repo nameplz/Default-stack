@@ -2,7 +2,7 @@
 
 프로젝트에 관한 가볍고 느슨한 수다로 아이디어를 구체화하고 요구사항을 명확히 한다. 대화가 끝나면 내용을 정리해 문서로 저장한다.
 
-다음 단계: [whats-wrong](whats-wrong.md) · 문서 규칙: [plugin-structure.md](../plugin-structure.md)
+문서 규칙: [plugin-structure.md](../plugin-structure.md)
 
 영감: [Karpathy의 ramble 세션](https://x.com/karpathy/status/2079610838143623371?s=20) (그대로 따르지 않음)
 
