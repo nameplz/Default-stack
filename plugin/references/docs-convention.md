@@ -16,7 +16,7 @@ Shared by every default-stack skill. Docs exist so a later session can restore c
 | `vision.md` | Purpose of the project and the idea |
 | `decisions.md` | Confirmed decisions and their rationale |
 | `research/<topic>.md` | Technical research, with sources |
-| `work/<topic>/` | Problem definition, Phase/Step plan, verification results |
+| `work/<topic>/` | Work records, such as `explore` reports |
 
 ## Rules
 

@@ -1,8 +1,10 @@
 {
   "name": "default-stack",
-  "version": "0.1.0",
-  "description": "A light harness that takes a vague idea from casual chat to a verified implementation.",
-  "author": { "name": "nameplz" },
+  "version": "0.2.0",
+  "description": "Shape a vague idea in casual chat, then set repositories up so checks, not instructions, hold agents to the work and changes auto-merge once verify passes.",
+  "author": {
+    "name": "nameplz"
+  },
   "license": "MIT",
   "skills": "./skills/"
 }

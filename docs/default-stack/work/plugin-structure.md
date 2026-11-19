@@ -15,27 +15,28 @@ default-stack/                      # 저장소 루트 = 마켓플레이스 루�
 │   ├── .claude-plugin/
 │   │   └── plugin.json             # Claude Code 매니페스트
 │   ├── skills/
-│   │   └── <skill>/                # coffee-chat, whats-wrong, shall-we, is-it-ok, just-do-it
+│   │   └── <skill>/                # coffee-chat, apply-stack, ship-it, formal, explore
 │   │       ├── SKILL.md            # disable-model-invocation: true
 │   │       └── agents/openai.yaml  # policy.allow_implicit_invocation: false
 │   └── references/
 │       ├── docs-convention.md      # 문서 탐색·생성·갱신 규칙 (모든 스킬 공통)
 │       ├── coffee-chat.md          # 각 단계의 실행 절차
-│       ├── whats-wrong.md
-│       ├── shall-we.md
-│       └── is-it-ok.md
+│       ├── apply-stack.md
+│       ├── ship-it.md
+│       ├── formal.md
+│       ├── explore.md
+│       └── pstack.md               # pstack 위치 찾기와 읽는 방법 (pstack을 쓰는 스킬 공통)
 ├── docs/default-stack/             # 이 설계 문서 (배포 대상 아님)
 ├── README.md
 └── LICENSE
 ```
 
 - 저장소 메타(마켓플레이스, README, 설계 문서)와 플러그인 본체를 `plugin/`으로 분리해, 설치 시 플러그인 파일만 복사되게 한다.
-- just-do-it은 자체 `references/` 문서가 없다. 단계 순서와 루프 한도(3회)만 `SKILL.md`에 두고 나머지는 위 문서들을 가리킨다.
 
 ## 역할 분리
 
 - `SKILL.md`: 호출 조건, 역할, 참조할 `references/` 문서. 명시 호출 전용.
-- `references/`: 실제 실행 절차. 개별 스킬과 just-do-it이 같은 문서를 참조한다.
+- `references/`: 실제 실행 절차. 공통 규칙(`docs-convention.md`, `pstack.md`)은 여러 스킬이 같은 문서를 참조한다.
 - 같은 규칙을 두 곳 이상에 쓰지 않는다.
 
 ## 문서 규칙 (`references/docs-convention.md`의 내용)
