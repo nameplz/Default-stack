@@ -33,6 +33,7 @@ Worktree and branch: <absolute worktree path and branch>
 Goal: <deliverable>
 Edit only: <paths>
 Verify: <exact commands, one per Bash call, and expected evidence>
+Diff: <exact read-only Git commands for the editable paths>
 State DB: <absolute DB path>
 Python: <selected executable>
 Script: <absolute script path used in the commands>
@@ -42,21 +43,25 @@ Keep the command prefix exactly as supplied. If a required tool call is denied,
 record a question naming the denied tool and path or command. Record any blocking
 question once and end the turn.
 Finish with a done report containing the full result and verification evidence.
-Include the commit or exact diff you verified if you changed code.
+If you changed code, run the supplied Git commands after verification and copy
+the Git patch output verbatim into the evidence's diff field. If you edit again,
+rerun verification and capture the new patch.
 Leave Git staging, commits, and delivery to the coordinator.
 ```
 
 For Claude, use unquoted Python, script, and DB paths with no spaces or shell metacharacters. If a path needs quoting, use a shell-safe wrapper or symlink path to the same executable, script, or DB. Use the exact same Python and script prefix in the Claude Bash allow rule. Give Claude one command per Bash call. Leave out `cd`, `&&`, and pipes. For Codex, quote paths as needed for its shell.
+
+Supply a status command and a diff against `HEAD` scoped to the Task's editable paths. For each planned new file, supply a separate `git diff --no-index` command against `/dev/null`. Exit code 1 from that command means it found differences. If the worker needs a diff command for another untracked file, have it record a question with the path. Check the path against the Task's edit scope before adding the command to the follow-up brief. Omit the `Diff` line for read-only Tasks.
 
 Use the following commands as examples for the brief. Replace the evidence JSON with the worker's full result. Use `status: "failure"` for a failed result. Use `changed_code: false` for a result with no code changes.
 
 ```sh
 /opt/python/bin/python3 /opt/team-up/team_up.py --db /var/tmp/team-up/state.db heartbeat 12 --turn 1
 /opt/python/bin/python3 /opt/team-up/team_up.py --db /var/tmp/team-up/state.db record 12 --turn 1 'Which path should I use?'
-/opt/python/bin/python3 /opt/team-up/team_up.py --db /var/tmp/team-up/state.db done 12 --turn 1 --evidence '{"status":"success","result":"Full result","verification":[{"command":"make verify","exit_code":0,"location":"artifacts/verify.log"}],"changed_code":true,"diff":"artifacts/task.patch"}'
+/opt/python/bin/python3 /opt/team-up/team_up.py --db /var/tmp/team-up/state.db done 12 --turn 1 --evidence '{"status":"success","result":"Full result with test output","verification":[{"command":"/usr/bin/python3 -m unittest","exit_code":0,"location":"completion report result"}],"changed_code":true,"diff":"<Git patch output encoded as a JSON string>"}'
 ```
 
-Use one terminal path per turn. A worker that records a blocking question ends the turn instead of running `done`. Store referenced logs and diffs at paths the coordinator can read and preserve before cleanup.
+Use one terminal path per turn. A worker that records a blocking question ends the turn instead of running `done`. Preserve the worker log and Git patch before cleanup.
 
 ### Codex worker
 
@@ -81,14 +86,33 @@ If you missed the thread ID and the Dispatch is `turn-ended` or `waiting`, read 
 
 - On a desktop user turn, prefer the host's `start_session` side session in the prepared worktree. Store its session ID. On a question, confirm that the current turn is idle before recording its exit and keep the session open for the answer. Send the follow-up to that exact session. When the Dispatch finishes, use the host's session state and stop controls to verify shutdown before releasing the slot. For a preserved session, confirm that team-up's execution has ended and leave the idle session open.
 - On a desktop notification or session-message turn, use `Agent` with `isolation: worktree` or start a Codex worker for a compatible Task. Use the host-returned Agent ID and worktree. If the host discards a worktree or offers no way to resume the same Agent, report that blocker and confirm shutdown before considering a retry. On these turns a desktop side-session card needs a user action to start.
-- From the CLI, set `python` and `script` to the exact unquoted paths in the brief. Build the `--allowedTools` list from the worker's DB command prefix, the Task's `Edit only` paths, and its `Verify` commands. Add one exact `Bash(<command>)` rule per verification command. Leave out edit rules for read-only Tasks. If Claude's Bash sandbox is enabled, include the absolute state directory in `sandbox.filesystem.allowWrite` on launch and resume. Save the returned `session_id`.
+- From the CLI, set `python` and `script` to the exact unquoted paths in the brief. Build the `--allowedTools` list from the worker's DB command prefix, the Task's `Edit only` paths, and its `Verify` and `Diff` commands. Add one exact `Bash(<command>)` rule for each supplied command under `Verify` and `Diff`. Leave out edit and diff rules for read-only Tasks. If Claude's Bash sandbox is enabled, include the absolute state directory in `sandbox.filesystem.allowWrite` on launch and resume. Save the returned `session_id`.
 
 In `claude -p`, `--allowedTools` accepts path-scoped `Edit` rules that cover both `Edit` and `Write`. Use paths relative to the worker's worktree, such as `Edit(./src/**)`. For an absolute path, use `Edit(//path/to/worktree/src/**)`. [Print-mode allow rules](https://code.claude.com/docs/en/headless#create-a-commit) [File permission patterns](https://code.claude.com/docs/en/permissions#read-and-edit)
 
-For a Task that allows edits under `src/` and `artifacts/` and lists `make verify` on its `Verify` line, use these rules in Bash or Zsh.
+For a Task with `Edit only: greet.py, test_greet.py` and `Verify: /usr/bin/python3 -m unittest`, give the worker the commands below. Each line is a separate Bash call. Run the last two commands only for the respective files listed as untracked (`??`) by status.
 
 ```sh
-allowed_tools=("Bash($python $script:*)" "Edit(./src/**)" "Edit(./artifacts/**)" "Bash(make verify)")
+/usr/bin/python3 -m unittest
+git --no-optional-locks status --short --untracked-files=all -- greet.py test_greet.py
+git --no-pager diff --no-ext-diff --no-textconv --binary HEAD -- greet.py test_greet.py
+git --no-pager diff --no-index --no-ext-diff --no-textconv --binary -- /dev/null greet.py
+git --no-pager diff --no-index --no-ext-diff --no-textconv --binary -- /dev/null test_greet.py
+```
+
+Use these rules in Bash or Zsh.
+
+```sh
+allowed_tools=(
+  "Bash($python $script:*)"
+  "Edit(./greet.py)"
+  "Edit(./test_greet.py)"
+  "Bash(/usr/bin/python3 -m unittest)"
+  "Bash(git --no-optional-locks status --short --untracked-files=all -- greet.py test_greet.py)"
+  "Bash(git --no-pager diff --no-ext-diff --no-textconv --binary HEAD -- greet.py test_greet.py)"
+  "Bash(git --no-pager diff --no-index --no-ext-diff --no-textconv --binary -- /dev/null greet.py)"
+  "Bash(git --no-pager diff --no-index --no-ext-diff --no-textconv --binary -- /dev/null test_greet.py)"
+)
 (
   cd "$worktree" || exit
   claude -p --output-format json \
@@ -130,7 +154,7 @@ If worker activity is still expected, start `wait <run-id> --timeout 30` as a ba
 
 ## Deliver and clean up
 
-1. Read the completion report and verify its branch, commit or diff, and evidence. Deliver those items to the user and record delivery. For PR delivery, hand off to [ship-it](ship-it.md) when the user invokes it. For a merge dependency, confirm the required `verify` check passed and the specified default branch contains the needed change before recording the merge.
+1. After confirming worker exit, read the completion report and check the branch and verification evidence. Check the full worktree status against the Task's edit scope. For working-tree changes, rerun the brief's Git commands and compare their patch output with the worker's report before staging. Deliver the branch, commit or diff, and verification evidence to the user and record delivery. For PR delivery, hand off to [ship-it](ship-it.md) when the user invokes it. For a merge dependency, confirm the required `verify` check passed and the specified default branch contains the needed change before recording the merge.
 2. Use `takeover` or `keep-open` before handing control to the user. Preserve the session and worktree in either case. Once the user takes over, stop sending instructions to the worker. Keep tracking the active turn until the host confirms it ended.
 3. Use `cleanup` to list candidates with confirmed exit and recorded delivery. Retain worktrees without a report for manual reconciliation. Before removing a candidate, confirm team-up ownership and worker exit. Recheck the recorded path and branch against Git. Check `git status --porcelain --untracked-files=all` in the worktree and confirm all results are delivered. Skip any worktree with changes, an unknown worker state, or a preservation request. If the host already removed the worktree, reconcile that with Git instead of substituting another path.
 4. Use regular `git worktree remove` after the checks pass. Preserve the branch, durable evidence, and DB. Delete the DB only on an explicit user request.
