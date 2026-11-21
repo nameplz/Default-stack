@@ -60,14 +60,16 @@ class TeamUpTest(unittest.TestCase):
             "--session", f"session-{dispatch}",
         )
 
-    def report(self, dispatch, turn, expected=0):
+    def report(self, dispatch, turn, expected=0, *, changed_code=True):
         evidence = {
             "status": "success", "result": "Full result\nSecond line",
             "verification": [
                 {"command": "python3 -m unittest", "exit_code": 0, "location": "test.log"}
             ],
-            "changed_code": True, "diff": "artifacts/task.patch",
+            "changed_code": changed_code,
         }
+        if changed_code:
+            evidence["diff"] = "artifacts/task.patch"
         return self.invoke(
             "done", dispatch, "--turn", turn, "--evidence", json.dumps(evidence),
             expected=expected,
@@ -196,13 +198,107 @@ class TeamUpTest(unittest.TestCase):
         second = self.task(run, "Second", "--after", first, "--gate", "Choose path")
         self.assertIsNone(self.invoke("reserve", run, "--task", second))
         dispatch, turn = self.start(run, first)
-        self.invoke("gate", run, "Choose path", "--decision", "Use path A")
+        self.invoke("gate", run, "Choose path", "--decision", "approve")
         self.assertIsNone(self.invoke("reserve", run, "--task", second))
         self.report(dispatch, turn)
         self.invoke("turn-ended", dispatch, "--turn", turn)
         self.assertIsNone(self.invoke("reserve", run, "--task", second))
         self.exit_worker(dispatch, turn)
         self.assertIsNotNone(self.invoke("reserve", run, "--task", second))
+
+    def test_rejection_keeps_gate_blocked_until_explicit_approval(self):
+        run = self.run_create()
+        task = self.task(run, "Rollout", "--gate", "rollout")
+        self.invoke("gate", run, "rollout", "--decision", "hold", expected=2)
+        self.assertIsNone(self.invoke("reserve", run, "--task", task))
+        rejected = self.invoke("gate", run, "rollout", "--decision", "reject", "--note", "Hold until Monday")
+        self.assertEqual(rejected["decision"], "reject")
+        self.assertEqual(self.invoke("status", run)["gates"][0]["note"], "Hold until Monday")
+        self.assertIsNone(self.invoke("reserve", run, "--task", task))
+        self.invoke("gate", run, "rollout", "--decision", "approve")
+        self.assertEqual(self.invoke("reserve", run, "--task", task)["task_id"], task)
+        self.invoke("gate", run, "rollout", "--decision", "reject", expected=1)
+
+    def test_init_refuses_v2_and_preserves_the_existing_database(self):
+        self.invoke("init")
+        with sqlite3.connect(self.db) as db:
+            db.execute("PRAGMA user_version=2")
+        result = self.invoke("init", expected=1)
+        self.assertIn("schema version 2", result.stderr)
+        self.assertIn("new --db path", result.stderr)
+        with sqlite3.connect(self.db) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 2)
+
+    def test_completion_follow_up_keeps_instructions_and_fences_reports(self):
+        worktree = self.linked_worktree()
+        run = self.run_create(slots=1)
+        task = self.task(run, "Review")
+        dispatch, turn = self.start(run, task, "--worktree", worktree, "--branch", "assigned")
+        instruction = self.invoke("instruct", dispatch, "Check one more thing")
+        question = self.invoke("record", dispatch, "--turn", turn, "Which file?")
+        self.report(dispatch, turn)
+        self.invoke("answer", question["id"], "README.md", expected=1)
+        self.invoke("begin", dispatch, expected=1)
+        self.exit_worker(dispatch, turn)
+        follow_up = self.invoke("instruct", dispatch, "Quote the first heading")
+        self.invoke("delivered", dispatch)
+        self.assertEqual(self.invoke("cleanup", run), [])
+
+        other, other_turn = self.start(run, self.task(run, "Other work"))
+        self.invoke("begin", dispatch, expected=1)
+        self.exit_worker(other, other_turn)
+        brief = self.invoke("begin", dispatch)
+        self.assertEqual((brief["id"], brief["turn"], brief["session"], brief["worktree"]),
+                         (dispatch, turn + 1, f"session-{dispatch}", str(worktree.resolve())))
+        self.assertEqual([m["id"] for m in brief["messages"] if m["kind"] == "instruction" and not m["consumed"]],
+                         [instruction["id"], follow_up["id"]])
+        self.assertIsNone(brief["evidence"])
+        self.assertEqual(brief["delivered"], 0)
+        self.invoke("answer", question["id"], "README.md", expected=1)
+        self.report(dispatch, turn, expected=1)
+        self.started(dispatch, turn + 1)
+        self.report(dispatch, turn + 1)
+        self.exit_worker(dispatch, turn + 1)
+        self.invoke("begin", dispatch, expected=1)
+        self.invoke("delivered", dispatch)
+        self.assertEqual([item["id"] for item in self.invoke("cleanup", run)], [dispatch])
+
+    def test_main_review_resumes_against_the_live_patch_and_cannot_be_cleaned_up(self):
+        worktree = self.linked_worktree()
+        branch = subprocess.check_output(
+            ["git", "branch", "--show-current"], cwd=self.cwd, text=True, timeout=30,
+        ).strip()
+        checkout = self.cwd
+        readme = checkout / "README.md"
+        original = readme.read_bytes()
+        readme.write_bytes(original + b"\nOnly in the main checkout\n")
+        diff = ["git", "--no-pager", "diff", "--no-ext-diff", "--no-textconv", "HEAD", "--", "README.md"]
+        patch = subprocess.check_output(diff, cwd=checkout, timeout=30)
+        self.assertIn(b"+Only in the main checkout", patch)
+        self.assertEqual(subprocess.check_output(diff, cwd=worktree, timeout=30), b"")
+
+        run = self.run_create()
+        task = self.task(run, "Review the live patch")
+        spec = ("--worktree", checkout, "--branch", branch)
+        self.invoke("reserve", run, "--task", task, *spec, expected=1)
+        self.invoke("reserve", run, "--task", task, "--review-main", expected=1)
+        self.invoke("reserve", run, "--task", task, "--review-main",
+                    "--worktree", worktree, "--branch", "assigned", expected=1)
+        dispatch, turn = self.start(run, task, "--review-main", *spec)
+        self.assertEqual(self.invoke("register", dispatch, "--turn", turn, *spec)["worktree"], str(checkout.resolve()))
+        question = self.invoke("record", dispatch, "--turn", turn, "Review the wording?")
+        waiting = self.exit_worker(dispatch, turn)
+        self.invoke("answer", question["id"], "Yes")
+        brief = self.invoke("begin", dispatch)
+        self.assertEqual((brief["turn"], brief["session"], brief["worktree"]),
+                         (turn + 1, waiting["session"], str(checkout.resolve())))
+        self.report(dispatch, turn + 1, expected=1)
+        self.report(dispatch, turn + 1, changed_code=False)
+        self.exit_worker(dispatch, turn + 1)
+        self.invoke("delivered", dispatch)
+        self.assertEqual(subprocess.check_output(diff, cwd=checkout, timeout=30), patch)
+        readme.write_bytes(original)
+        self.assertEqual(self.invoke("cleanup", run), [])
 
     def test_merge_dependency_requires_designated_base(self):
         self.linked_worktree()

@@ -15,7 +15,7 @@ import sys
 import time
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SCHEMA = """
 CREATE TABLE repository (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -50,7 +50,8 @@ CREATE TABLE dependencies (
 CREATE TABLE gates (
     run_id INTEGER NOT NULL REFERENCES runs(id),
     name TEXT NOT NULL,
-    decision TEXT,
+    decision TEXT CHECK (decision IN ('approve', 'reject')),
+    note TEXT,
     PRIMARY KEY (run_id, name)
 );
 CREATE TABLE task_gates (
@@ -71,6 +72,7 @@ CREATE TABLE dispatches (
     session TEXT,
     worktree TEXT,
     branch TEXT,
+    review_main INTEGER NOT NULL DEFAULT 0,
     unresumable INTEGER NOT NULL DEFAULT 0,
     reserved_at TEXT NOT NULL,
     heartbeat_at TEXT,
@@ -177,7 +179,8 @@ def connect(path, repo_common_dir=None):
                 if db.execute("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").fetchone():
                     raise StateError("refusing to initialize an existing database with unknown objects")
             elif version != SCHEMA_VERSION:
-                raise StateError(f"database schema version {version} does not match {SCHEMA_VERSION}")
+                raise StateError(f"database schema version {version} does not match {SCHEMA_VERSION}; "
+                                 "keep the existing DB and run init with a new --db path")
             elif create and repository_common_dir(db) != str(repo_common_dir):
                 raise StateError("database belongs to a different repository")
         if create:
@@ -296,19 +299,19 @@ def create_task(db, args):
 
 def decide_gate(db, args):
     run_row(db, args.run)
-    gate = db.execute("SELECT decision FROM gates WHERE run_id = ? AND name = ?",
+    gate = db.execute("SELECT decision, note FROM gates WHERE run_id = ? AND name = ?",
                       (args.run, args.name)).fetchone()
-    result = {"run_id": args.run, "name": args.name, "decision": args.decision}
-    if gate and gate["decision"] is not None:
-        if gate["decision"] != args.decision:
-            raise StateError(f"gate {args.name!r} already has a decision")
+    result = {"run_id": args.run, "name": args.name, "decision": args.decision, "note": args.note}
+    if gate and gate["decision"] == "approve" and args.decision == "reject":
+        raise StateError(f"gate {args.name!r} already approved dependent work")
+    if gate and (gate["decision"], gate["note"]) == (args.decision, args.note):
         return result
     db.execute(
-        """INSERT INTO gates(run_id, name, decision) VALUES (?, ?, ?)
-        ON CONFLICT(run_id, name) DO UPDATE SET decision = excluded.decision""",
-        (args.run, args.name, args.decision),
+        """INSERT INTO gates(run_id, name, decision, note) VALUES (?, ?, ?, ?)
+        ON CONFLICT(run_id, name) DO UPDATE SET decision = excluded.decision, note = excluded.note""",
+        (args.run, args.name, args.decision, args.note),
     )
-    event(db, args.run, "gate-decided", {"name": args.name, "decision": args.decision})
+    event(db, args.run, "gate-decided", result)
     return result
 
 
@@ -347,7 +350,7 @@ READY = """
       )
       AND NOT EXISTS (
           SELECT 1 FROM task_gates tg JOIN gates g ON g.run_id = tg.run_id AND g.name = tg.name
-          WHERE tg.task_id = t.id AND g.decision IS NULL
+          WHERE tg.task_id = t.id AND g.decision IS NOT 'approve'
       )
     ORDER BY t.id LIMIT 1
 """
@@ -369,11 +372,11 @@ def worktree_spec(args):
     return str(Path(args.worktree).expanduser().resolve()), args.branch
 
 
-def linked_worktrees(db):
+def worktrees(db, *, primary=False):
     records = git("--git-dir", repository_common_dir(db), "worktree", "list", "--porcelain", "-z").split("\0\0")
     worktrees = {}
     # Git lists the repository's primary worktree first.
-    for record in records[1:]:
+    for record in records[:1] if primary else records[1:]:
         values = dict(line.split(" ", 1) for line in record.split("\0") if " " in line)
         if "worktree" in values:
             ref = values.get("branch", "")
@@ -382,33 +385,40 @@ def linked_worktrees(db):
     return worktrees
 
 
-def check_worktree(db, path, branch):
-    if not Path(path).is_dir() or linked_worktrees(db).get(path) != branch:
-        raise StateError(f"expected a linked worktree at {path!r} on branch {branch!r}")
+def check_worktree(db, path, branch, review_main=False):
+    if not Path(path).is_dir() or worktrees(db, primary=review_main).get(path) != branch:
+        placement = "the primary checkout" if review_main else "a linked worktree"
+        raise StateError(f"expected {placement} at {path!r} on branch {branch!r}")
 
 
 def check_worktree_claim(db, path, dispatch_id=None):
     conflict = db.execute(
-        """SELECT id FROM dispatches WHERE worktree = ? AND id IS NOT ?
-        AND (phase != 'closed' OR keep_open OR taken_over OR (evidence IS NOT NULL AND NOT delivered))""",
+        """SELECT d.id FROM dispatches d WHERE d.worktree = ? AND d.id IS NOT ?
+        AND (d.phase != 'closed' OR d.keep_open OR d.taken_over OR (d.evidence IS NOT NULL AND NOT d.delivered)
+             OR (d.evidence IS NOT NULL AND d.abandon_reason IS NULL AND EXISTS (
+                 SELECT 1 FROM messages m WHERE m.dispatch_id = d.id AND m.kind = 'instruction' AND NOT m.consumed
+             )))""",
         (path, dispatch_id),
     ).fetchone()
     if conflict:
         raise StateError(f"worktree is still held by dispatch {conflict['id']}")
 
 
-def insert_dispatch(db, task, worktree, branch, attempt=1, retry_of=None):
+def insert_dispatch(db, task, worktree, branch, attempt=1, retry_of=None, review_main=False):
+    if review_main and worktree is None:
+        raise StateError("--review-main requires --worktree and --branch")
     if worktree:
-        if Path(worktree).exists():
-            check_worktree(db, worktree, branch)
+        if review_main or Path(worktree).exists():
+            check_worktree(db, worktree, branch, review_main)
         check_worktree_claim(db, worktree)
     dispatch_id = db.execute(
-        """INSERT INTO dispatches(task_id, attempt, retry_of, phase, worktree, branch, reserved_at)
-        VALUES (?, ?, ?, 'reserved', ?, ?, ?)""",
-        (task["id"], attempt, retry_of, worktree, branch, timestamp()),
+        """INSERT INTO dispatches(task_id, attempt, retry_of, phase, worktree, branch, review_main, reserved_at)
+        VALUES (?, ?, ?, 'reserved', ?, ?, ?, ?)""",
+        (task["id"], attempt, retry_of, worktree, branch, review_main, timestamp()),
     ).lastrowid
     dispatch = dispatch_row(db, dispatch_id)
-    dispatch_event(db, dispatch, "reserved", attempt=attempt, retry_of=retry_of, worktree=worktree, branch=branch)
+    dispatch_event(db, dispatch, "reserved", attempt=attempt, retry_of=retry_of,
+                   worktree=worktree, branch=branch, review_main=review_main)
     return brief(db, dispatch_id)
 
 
@@ -422,7 +432,7 @@ def reserve(db, args):
     task = db.execute(READY, (args.run, args.task, args.task)).fetchone()
     if task is None:
         return None
-    return insert_dispatch(db, task, worktree, branch)
+    return insert_dispatch(db, task, worktree, branch, review_main=args.review_main)
 
 
 def retry(db, args):
@@ -440,8 +450,11 @@ def retry(db, args):
         raise StateError("this task reached three failed starts. Use retry --override only on user instruction.")
     if not slot_available(db, run_row(db, task["run_id"])):
         raise StateError("no run slot is available")
-    replacement = insert_dispatch(db, task, *worktree_spec(args),
-                                  attempt=previous["attempt"] + 1, retry_of=previous["id"])
+    worktree, branch = worktree_spec(args)
+    if previous["review_main"] and worktree is None:
+        worktree, branch = previous["worktree"], previous["branch"]
+    replacement = insert_dispatch(db, task, worktree, branch, attempt=previous["attempt"] + 1,
+                                  retry_of=previous["id"], review_main=bool(previous["review_main"]))
     if args.override:
         dispatch_event(db, replacement, "retry-override", retry_of=previous["id"], start_failures=count)
     return replacement
@@ -471,23 +484,43 @@ def questions(db, dispatch):
 def begin(db, args):
     snapshot = dispatch_row(db, args.dispatch)
     if snapshot["worktree"]:
-        check_worktree(db, snapshot["worktree"], snapshot["branch"])
+        check_worktree(db, snapshot["worktree"], snapshot["branch"], snapshot["review_main"])
     with transaction(db):
         dispatch = dispatch_row(db, args.dispatch)
         if (dispatch["worktree"], dispatch["branch"]) != (snapshot["worktree"], snapshot["branch"]):
             raise StateError("the worktree changed before the turn could begin; check status")
-        if dispatch["stop_requested"] or dispatch["taken_over"]:
-            raise StateError("the dispatch is stopped or taken over")
-        if dispatch["phase"] == "waiting":
+        if dispatch["stop_requested"] or dispatch["taken_over"] or dispatch["abandon_reason"]:
+            raise StateError("the dispatch is stopped, taken over, or abandoned")
+        phase = dispatch["phase"]
+        follow_up = phase == "closed" and dispatch["evidence"] is not None
+        if phase == "waiting" or follow_up:
             if dispatch["unresumable"] or not dispatch["session"] or not dispatch["worktree"]:
                 raise StateError("the saved host session and worktree cannot be resumed")
+        if phase == "waiting":
             if any(question["answer"] is None for question in questions(db, dispatch)):
                 raise StateError("answer all questions from the previous turn before resuming")
-        elif dispatch["phase"] != "reserved":
-            raise StateError("begin requires a reservation or an exited question turn")
+        elif follow_up:
+            if not db.execute(
+                "SELECT 1 FROM messages WHERE dispatch_id = ? AND kind = 'instruction' AND NOT consumed",
+                (args.dispatch,),
+            ).fetchone():
+                raise StateError("record an instruction before beginning a completion follow-up")
+            if db.execute("SELECT 1 FROM dispatches WHERE task_id = ? AND attempt > ?",
+                          (dispatch["task_id"], dispatch["attempt"])).fetchone():
+                raise StateError("a newer dispatch already exists for this task")
+            if not slot_available(db, run_row(db, dispatch["run_id"])):
+                raise StateError("no run slot is available for the follow-up")
+            check_worktree_claim(db, dispatch["worktree"], args.dispatch)
+            dispatch_event(db, dispatch, "completion-followed-up", evidence=json.loads(dispatch["evidence"]),
+                           delivered=bool(dispatch["delivered"]))
+            db.execute("UPDATE tasks SET completed_at = NULL WHERE id = ? AND merged_commit IS NULL",
+                       (dispatch["task_id"],))
+        elif phase != "reserved":
+            raise StateError("begin requires a reservation or a confirmed exit before resuming")
         db.execute(
             """UPDATE dispatches SET phase = 'running', turn = turn + 1, runtime = NULL,
-            heartbeat_at = ?, turn_ended_at = NULL, exited_at = NULL, exit_code = NULL WHERE id = ?""",
+            heartbeat_at = ?, turn_ended_at = NULL, exited_at = NULL, exit_code = NULL,
+            outcome = NULL, evidence = NULL, delivered = 0 WHERE id = ?""",
             (timestamp(), args.dispatch),
         )
         dispatch_event(db, dispatch_row(db, args.dispatch), "turn-begun")
@@ -508,7 +541,7 @@ def save_worktree(db, dispatch, worktree, branch):
 
 def register(db, args):
     worktree, branch = worktree_spec(args)
-    check_worktree(db, worktree, branch)
+    check_worktree(db, worktree, branch, dispatch_row(db, args.dispatch)["review_main"])
     with transaction(db):
         save_worktree(db, current_turn(db, args), worktree, branch)
         return brief(db, args.dispatch)
@@ -517,20 +550,21 @@ def register(db, args):
 def started(db, args):
     worktree, branch = worktree_spec(args)
     if worktree:
-        check_worktree(db, worktree, branch)
+        check_worktree(db, worktree, branch, dispatch_row(db, args.dispatch)["review_main"])
     with transaction(db):
         dispatch = current_turn(db, args)
         phase = dispatch["phase"]
-        if phase not in ("running", "turn-ended", "waiting"):
-            raise StateError("start confirmation requires a running, ended, or waiting turn")
+        recovering = phase == "waiting" or (phase == "closed" and dispatch["evidence"])
+        if phase not in ("running", "turn-ended") and not recovering:
+            raise StateError("start confirmation requires an active, waiting, or completed turn")
         if phase == "running" and args.runtime is None:
             raise StateError("start confirmation for a running turn requires --runtime")
-        if args.runtime is not None and (phase == "waiting" or dispatch["runtime"]):
+        if args.runtime is not None and (recovering or dispatch["runtime"]):
             if dispatch["runtime"] != args.runtime:
                 raise StateError("the supplied runtime must match the recorded runtime identity")
         if dispatch["session"] and args.session and dispatch["session"] != args.session:
             raise StateError("the dispatch already has a different session identity")
-        if phase == "waiting" or args.runtime is None:
+        if recovering or args.runtime is None:
             if args.session is None or worktree or args.unresumable:
                 raise StateError("session recovery requires --session without worktree or unresumable options")
             if dispatch["session"] is None:
@@ -659,7 +693,8 @@ def answer_question(db, args):
             raise StateError("the question already has a different answer")
         return dict(message)
     dispatch = dispatch_row(db, message["dispatch_id"])
-    if dispatch["phase"] == "closed" or dispatch["stop_requested"] or dispatch["evidence"]:
+    if (dispatch["phase"] == "closed" or dispatch["stop_requested"] or dispatch["evidence"]
+            or message["turn"] != dispatch["turn"]):
         raise StateError("the dispatch no longer accepts answers")
     db.execute("UPDATE messages SET answer = ? WHERE id = ?", (args.answer, args.question_id))
     dispatch_event(db, dispatch, "answer", message_id=args.question_id, answer=args.answer)
@@ -687,7 +722,8 @@ def ask(db, args):
 
 def instruct(db, args):
     dispatch = dispatch_row(db, args.dispatch)
-    if dispatch["phase"] == "closed" or dispatch["stop_requested"] or dispatch["evidence"] or dispatch["taken_over"]:
+    if (dispatch["stop_requested"] or dispatch["taken_over"] or dispatch["abandon_reason"]
+            or (dispatch["phase"] == "closed" and not dispatch["evidence"])):
         raise StateError("the dispatch no longer accepts instructions")
     message_id = db.execute(
         "INSERT INTO messages(dispatch_id, turn, kind, text) VALUES (?, ?, 'instruction', ?)",
@@ -725,12 +761,16 @@ def completion_evidence(value):
 def done(db, args):
     dispatch = current_turn(db, args)
     evidence = completion_evidence(args.evidence)
+    if dispatch["review_main"] and evidence["changed_code"]:
+        raise StateError("a main checkout review requires changed_code: false")
     if dispatch["evidence"] is not None:
         if json.loads(dispatch["evidence"]) == evidence:
             return brief(db, args.dispatch)
         raise StateError("the dispatch already has a different completion report")
     check_mutable_worker(dispatch)
     db.execute("UPDATE dispatches SET evidence = ? WHERE id = ?", (json.dumps(evidence, ensure_ascii=False), args.dispatch))
+    db.execute("UPDATE messages SET consumed = 1 WHERE dispatch_id = ? AND kind = 'instruction' AND turn < ?",
+               (args.dispatch, args.turn))
     if evidence["status"] == "success":
         db.execute("UPDATE tasks SET completed_at = ? WHERE id = ?", (timestamp(), dispatch["task_id"]))
     dispatch_event(db, dispatch, "done", status=evidence["status"])
@@ -813,7 +853,10 @@ def cleanup(db, args):
     rows = db.execute(
         """SELECT d.id, d.worktree, d.branch FROM dispatches d JOIN tasks t ON t.id = d.task_id
         WHERE t.run_id = ? AND d.worktree IS NOT NULL AND d.phase = 'closed'
-        AND NOT d.keep_open AND NOT d.taken_over AND d.delivered
+        AND NOT d.review_main AND NOT d.keep_open AND NOT d.taken_over AND d.delivered
+        AND (d.abandon_reason IS NOT NULL OR NOT EXISTS (
+            SELECT 1 FROM messages m WHERE m.dispatch_id = d.id AND m.kind = 'instruction' AND NOT m.consumed
+        ))
         AND NOT EXISTS (
             SELECT 1 FROM dispatches other WHERE other.worktree = d.worktree
             AND (other.id > d.id OR other.phase != 'closed' OR other.keep_open OR other.taken_over
@@ -822,11 +865,11 @@ def cleanup(db, args):
     ).fetchall()
     if not rows:
         return []
-    worktrees = linked_worktrees(db)
+    linked = worktrees(db)
     candidates = []
     for row in rows:
         path = row["worktree"]
-        if worktrees.get(path) != row["branch"] or not Path(path).is_dir():
+        if linked.get(path) != row["branch"] or not Path(path).is_dir():
             continue
         if not git("--no-optional-locks", "status", "--porcelain", "--untracked-files=all", directory=path):
             candidates.append(dict(row))
@@ -894,13 +937,15 @@ def parser():
 
     gate = command("gate", decide_gate, "run")
     gate.add_argument("name", type=nonempty)
-    gate.add_argument("--decision", type=nonempty, required=True)
+    gate.add_argument("--decision", choices=("approve", "reject"), required=True)
+    gate.add_argument("--note", type=nonempty)
     merged = command("merged", mark_merged, "task", writes=False)
     merged.add_argument("--base", type=nonempty, required=True)
     merged.add_argument("--commit", type=nonempty, required=True)
 
     reservation = command("reserve", reserve, "run")
     reservation.add_argument("--task", type=positive_int)
+    reservation.add_argument("--review-main", action="store_true", help="place a read-only review in the primary checkout")
     worktree_options(reservation)
     retry_command = command("retry", retry, "dispatch")
     worktree_options(retry_command)
