@@ -25,9 +25,9 @@
 | 형식 검증(`formal`)과 릴리스별 탐색(`explore`)을 apply-stack 기반 위의 별도 스킬로 둠. explore는 버그마다 PR 하나, 실행당 PR 최대 5개 | 기반(verify, 검증 스킬, 자동 병합)이 있어야 동작. 버그를 묶으면 되돌리기 어려움 |
 | 반복 지적 규칙은 hook이 아니라 apply-stack이 프로젝트 `AGENTS.md`에 넣음 | `hooks/` 미사용 원칙 유지. 규칙이 저장소와 함께 이동 |
 | `team-up` 코디네이터는 Claude 데스크톱 앱 Code 탭과 Claude Code CLI에서 지원, Codex는 워커로만 지원. Claude·Codex 워커별 Git worktree 배정, Run·Task·Dispatch 상태는 SQLite에 기록 | 두 호스트에서 로컬 워커 조율과 진행 상태 보존 |
-| 상태 DB는 `~/.local/state/default-stack/team-up/<repo-id>.db`. `git rev-parse --path-format=absolute --git-common-dir` 결과의 `realpath`를 해시해 `<repo-id>`를 구함 | Codex 샌드박스가 `.git`을 보호함. 메인 체크아웃과 linked worktree에서 같은 ID를 확인 ([DB 쓰기 검증](research/team-up-db-write.md)) |
-| Codex 워커는 지정된 worktree에서 `codex exec --json`으로 시작. `thread.started`의 ID와 worktree를 기록하고 같은 worktree에서 해당 ID로 `codex exec resume` 실행. 시작·재개에 `-s workspace-write --add-dir <state dir>` 적용 | [Codex 실행 방식](research/chatgpt-desktop-app.md), [DB 쓰기 검증](research/team-up-db-write.md) |
-| 데스크톱 코디네이터는 사용자 턴에서 Claude 워커 배정 시 사이드 세션 우선. 알림이나 다른 세션 메시지로 시작된 턴에서는 사이드 세션 시작 불가. 자동 후속 배정은 worktree 서브에이전트 또는 `codex exec` 사용. CLI Claude 워커는 `claude -p`의 `--allowedTools`로 team-up 스크립트 허용, 샌드박스 사용 시 `sandbox.filesystem.allowWrite`에 상태 디렉터리 추가. 결과 JSON의 `permission_denials`와 DB 기록 확인 | 데스크톱 사이드 세션·worktree 서브에이전트의 DB 쓰기 확인. `claude -p`는 Bash 사용이 거부돼도 종료 코드 0 가능. [후보 실험·호스트 검증](research/team-up-candidate-exp.md), [DB 쓰기 검증](research/team-up-db-write.md) |
+| 상태 DB는 `~/.local/state/default-stack/team-up/<repo-id>.db`. `git rev-parse --path-format=absolute --git-common-dir` 결과의 `realpath`를 해시해 `<repo-id>`를 구함. `init`에서 Git common dir을 DB에 저장하고 worktree 검사에 사용 | Codex 샌드박스가 `.git`을 보호함. 메인 체크아웃과 linked worktree에서 같은 ID를 확인. `--db`를 지정하면 다른 디렉터리에서도 같은 저장소의 worktree를 검사. [DB 쓰기 검증](research/team-up-db-write.md) |
+| Codex 워커는 지정된 worktree에서 `codex exec --json`으로 시작. `thread.started`의 ID와 worktree를 기록하고 같은 worktree에서 해당 ID로 `codex exec resume` 실행. ID 기록을 놓쳤으면 `turn-ended`나 `waiting`에서 현재 턴의 저장된 JSONL로 빈 세션 ID를 채움. 시작·재개에 `-s workspace-write --add-dir <state dir>` 적용 | [Codex 실행 방식](research/chatgpt-desktop-app.md), [DB 쓰기 검증](research/team-up-db-write.md) |
+| 데스크톱 코디네이터는 사용자 턴에서 Claude 워커 배정 시 사이드 세션 우선. 알림이나 다른 세션 메시지로 시작된 턴에서는 사이드 세션 시작 불가. 자동 후속 배정은 worktree 서브에이전트 또는 `codex exec` 사용. CLI Claude 워커는 `claude -p`의 `--allowedTools`에 브리프의 따옴표 없는 Python·스크립트 접두사를 그대로 지정. Bash 호출당 DB 명령 하나를 실행. 샌드박스 사용 시 `sandbox.filesystem.allowWrite`에 상태 디렉터리 추가. 결과 JSON의 `permission_denials`와 DB 기록 확인 | 데스크톱 사이드 세션·worktree 서브에이전트의 DB 쓰기 확인. `claude -p`는 Bash 사용이 거부돼도 종료 코드 0 가능. [후보 실험·호스트 검증](research/team-up-candidate-exp.md), [DB 쓰기 검증](research/team-up-db-write.md) |
 | `skills/team-up/scripts/`에 Python 표준 라이브러리만 쓰는 스크립트 포함. 스킬 문서는 상대경로로 참조, 코디네이터는 스킬 위치에서 계산한 실행 경로를 워커 브리프에 명시. 워커에게 스크립트로 DB를 갱신하도록 지시 | 스킬 내부에 실행 절차 배포. `--add-dir`는 디렉터리 쓰기 권한 부여, 스크립트 사용은 워커 지침 |
 | 코디네이터만 DB를 초기화하고 WAL 모드와 스키마를 설정. 워커는 연결 직후 `busy_timeout`을 설정하고 기존 저널 모드를 유지 | 새 DB에서 동시에 WAL 모드로 전환하자 `database is locked`로 250행 중 200행만 기록. 코디네이터가 먼저 초기화한 뒤 3회 모두 250행 기록 ([DB 쓰기 검증](research/team-up-db-write.md)) |
 | `team-up`에 기존 명시 호출 정책 적용. 전환 시 사용자 환경의 `~/.agents/skills/orchestration` 스텁 비활성화. Dispatch를 받은 워커는 브리프에 지정된 명령 실행 | 자연어 위임 요청으로 기존 Orca 스텁이 실행되는 경로 제거 |
@@ -40,7 +40,7 @@
 | team-up은 브랜치와 커밋 또는 diff, 검증 증거 전달. PR 전달은 사용자의 `ship-it` 명시 호출로 진행, 기본 브랜치 반영은 필수 `verify` 통과 후 진행. 병합이 선행 조건인 Task는 지정 기본 브랜치 반영을 확인한 뒤 시작 | 워커 완료와 기본 브랜치 반영을 별도 상태로 관리. [OSS 조사](research/team-up-oss.md) |
 | 첫 구현 범위는 로컬 단일 Git 저장소와 team-up이 시작한 워커. 원격 실행·페더레이션·봇, 그룹 주소, 별도 전달 영수증, 기존 터미널 주입, 여러 Run 동시 감시는 범위에서 제외 | 단일 머신의 작업·질문·복구 기록은 SQLite와 Dispatch별 메시지로 보존. [OSS 조사](research/team-up-oss.md) |
 | 현재 턴 번호와 일치하는 워커 보고만 수락 | 재개 전 턴의 늦은 보고가 현재 상태를 바꾸지 못하게 함 |
-| 이벤트 커서는 `ack`로 저장하고 `wait`는 조치가 필요한 이벤트나 시간 초과에만 반환 | 재시작 시 미확인 보고를 다시 읽고 heartbeat로 인한 깨우기를 줄임 |
+| 이벤트 커서는 `ack`로 저장. `wait`는 워커의 `question`, `done` 또는 시간 초과에 반환. 코디네이터의 `turn-ended`와 `exited`는 커서에 반영. 워커 종료는 호스트 작업의 완료 알림으로 확인 | 재시작 시 미확인 질문과 완료 보고를 다시 읽고 코디네이터가 직접 남긴 보고로 인한 깨우기를 방지 |
 | 답변을 기다리는 Dispatch도 슬롯을 유지 | 사용자 결정 |
 | 시작 3회 실패 후 사용자 지시가 있을 때만 `retry --override`로 한 번 재시도 | 재시도 루프를 막고 예외 사용을 기록 |
 | 영향받는 SQLite 버전이면 `init`과 `status` 출력에 WAL-reset 경고 표시 | 초기화는 허용하고 수정된 Python 빌드 사용을 안내. [SQLite 문서](https://www.sqlite.org/wal.html#the_wal_reset_bug) |

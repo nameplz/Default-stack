@@ -6,7 +6,7 @@ Use one Claude coordinator for one active Run in one local Git repository. Start
 
 1. In the Claude desktop app's Code tab, use the host's side-session tools when they are available. Note whether the current turn came from the user or a background notification. In the Claude Code CLI, use shell jobs for external workers. If the host is Codex, direct the user to Claude Code.
 2. Use Python 3 with the SQLite WAL-reset fix for the coordinator, worker commands, and Claude Bash allow rule. `init` and `status` warn if the current Python uses an affected version. The fix is in SQLite 3.51.3 and later, with backports starting at 3.44.6 and 3.50.7 on their respective branches. [SQLite's WAL-reset notes](https://www.sqlite.org/wal.html#the_wal_reset_bug)
-3. Resolve `scripts/team_up.py` relative to the installed `SKILL.md`. Set `script` to its absolute path. Initialize a new database with `init` before any worker connects. Keep the absolute DB path returned by `init`. Set `db` to that path and `state_dir` to its parent. Pass the same `--db "$db"` to each worker so it uses the coordinator's database even when an override is in effect.
+3. Resolve `scripts/team_up.py` relative to the installed `SKILL.md`. Set `script` to its absolute path and `python` to the selected Python executable. Run `init` from the target repository before any worker connects. Keep the absolute DB path returned by `init`. Set `db` to that path and `state_dir` to its parent. Give each worker the same DB path. Worktree checks use the Git common directory saved at `init`, so with an absolute `--db` path they work from any directory.
 4. On pickup, reuse the saved DB path and open the existing Run with `status <run-id>`. Reconcile its worker handles, worktrees, unprocessed events, and pending questions before reserving anything. The DB path defaults to `~/.local/state/default-stack/team-up/<repo-id>.db`. The ID is the first 16 hex digits of the SHA-256 of the real path returned by `git rev-parse --path-format=absolute --git-common-dir`.
 5. For a new Run, use `run-create --goal <goal> --slots <count>`. Keep its ID for pickup. Set `--base <ref>` when a dependency requires a merge into a designated branch. Use `task-create` to record each Task's worker type, goal, editable paths, and required completion evidence. Create prerequisites first. Use `--after` for a completion dependency and `--after-merge` for a merge dependency. Add any user decision gate with `--gate <name>`. Record the user's decision with `gate` before dispatching dependent work.
 
@@ -14,7 +14,7 @@ Use the local script's `--help` for command arguments. The examples put `--db` b
 
 ## Reserve before launching
 
-Use `reserve <run-id>` to check Task dependencies, decision gates, and slot capacity. Use `--task <task-id>` when selecting a specific Task. Launch only when the command returns a Dispatch. Keep its Task ID, Dispatch ID, and attempt number.
+Use `reserve <run-id>` to check Task dependencies, decision gates, and slot capacity. Use `--task <task-id>` when selecting a specific Task. The command returns `null` and exits with code 0 if no slot or eligible Task is available. Launch only when the command returns a Dispatch. Keep its Task ID, Dispatch ID, and attempt number.
 
 Use a distinct worktree and branch for each worker. For CLI workers and desktop side sessions, reserve the intended path and branch with `--worktree` and `--branch`. Create that worktree from the appropriate base revision and verify it against `git worktree list --porcelain`. For a host-created worktree, use `register` to record the assigned path and branch as soon as they become available.
 
@@ -22,7 +22,7 @@ Call `begin <dispatch-id>` immediately before starting or resuming the worker. U
 
 ### Worker brief
 
-Give each worker a filled-in brief. Quote arguments for the actual shell and include the installed script path in each command.
+Give each worker a filled-in brief. Include the exact commands with concrete paths and IDs.
 
 ```text
 Run: <run ID>
@@ -35,22 +35,24 @@ Edit only: <paths>
 Verify: <commands and expected evidence>
 State DB: <absolute DB path>
 Python: <selected executable>
-Script: <absolute installed script path>
+Script: <absolute script path used in the commands>
 
-Run in the assigned worktree. Send progress and questions through the supplied
-script commands. If blocked on a question, record it once and end the turn.
+Run each supplied command in its own Bash call from the assigned worktree.
+Keep the command prefix exactly as supplied. If blocked on a question, record
+it once and end the turn.
 Finish with a done report containing the full result and verification evidence.
 Include the commit or exact diff you verified if you changed code.
 Leave Git staging, commits, and delivery to the coordinator.
 ```
 
-Put these commands in the brief with concrete paths and IDs. Replace the evidence JSON with the worker's full result. Use `status: "failure"` for a failed result. Use `changed_code: false` for a result with no code changes.
+For Claude, use unquoted Python, script, and DB paths with no spaces or shell metacharacters. If a path needs quoting, use a shell-safe wrapper or symlink path to the same executable, script, or DB. Use the exact same Python and script prefix in the Claude Bash allow rule. Give Claude one command per Bash call. Leave out `cd`, `&&`, and pipes. For Codex, quote paths as needed for its shell.
+
+Use the following commands as examples for the brief. Replace the evidence JSON with the worker's full result. Use `status: "failure"` for a failed result. Use `changed_code: false` for a result with no code changes.
 
 ```sh
-python3 "$script" --db "$db" heartbeat "$dispatch" --turn "$turn"
-python3 "$script" --db "$db" record "$dispatch" --turn "$turn" 'Which path should I use?'
-python3 "$script" --db "$db" done "$dispatch" --turn "$turn" --evidence \
-  '{"status":"success","result":"Full result","verification":[{"command":"make verify","exit_code":0,"location":"artifacts/verify.log"}],"changed_code":true,"diff":"artifacts/task.patch"}'
+/opt/python/bin/python3 /opt/team-up/team_up.py --db /var/tmp/team-up/state.db heartbeat 12 --turn 1
+/opt/python/bin/python3 /opt/team-up/team_up.py --db /var/tmp/team-up/state.db record 12 --turn 1 'Which path should I use?'
+/opt/python/bin/python3 /opt/team-up/team_up.py --db /var/tmp/team-up/state.db done 12 --turn 1 --evidence '{"status":"success","result":"Full result","verification":[{"command":"make verify","exit_code":0,"location":"artifacts/verify.log"}],"changed_code":true,"diff":"artifacts/task.patch"}'
 ```
 
 Use one terminal path per turn. A worker that records a blocking question ends the turn instead of running `done`. Store referenced logs and diffs at paths the coordinator can read and preserve before cleanup.
@@ -72,17 +74,19 @@ codex exec -C "$worktree" -s workspace-write --add-dir "$state_dir" \
 
 Record `turn.completed` or `turn.failed` with `turn-ended` when observed. After the host confirms process exit, call `exited` with the actual exit code. Check the DB for a `done` report before treating the Task as complete.
 
+If you missed the thread ID and the Dispatch is `turn-ended` or `waiting`, read `thread.started` from the saved JSONL. Fill the missing ID for the current turn with `started <dispatch-id> --turn <turn> --session <thread-id>` before resuming.
+
 ### Claude worker
 
 - On a desktop user turn, prefer the host's `start_session` side session in the prepared worktree. Store its session ID. On a question, confirm that the current turn is idle before recording its exit and keep the session open for the answer. Send the follow-up to that exact session. When the Dispatch finishes, use the host's session state and stop controls to verify shutdown before releasing the slot. For a preserved session, confirm that team-up's execution has ended and leave the idle session open.
 - On a desktop notification or session-message turn, use `Agent` with `isolation: worktree` or start a Codex worker for a compatible Task. Use the host-returned Agent ID and worktree. If the host discards a worktree or offers no way to resume the same Agent, report that blocker and confirm shutdown before considering a retry. On these turns a desktop side-session card needs a user action to start.
-- From the CLI, run Claude in the assigned worktree with the Bash allow rule below. If Claude's Bash sandbox is enabled, include the absolute state directory in `sandbox.filesystem.allowWrite` for the worker launch. Save the returned `session_id`. Add `--resume "$session_id"` on the next turn in the same worktree and keep the allow rule and state-directory permission.
+- From the CLI, set `python` and `script` to the exact unquoted paths in the brief. Launch Claude in the assigned worktree with the Bash allow rule below. If Claude's Bash sandbox is enabled, include the absolute state directory in `sandbox.filesystem.allowWrite` for the worker launch. Save the returned `session_id`. Add `--resume "$session_id"` on the next turn in the same worktree and keep the allow rule and state-directory permission.
 
 ```sh
 (
   cd "$worktree" || exit
   claude -p --output-format json \
-    --allowedTools "Bash(python3 $script:*)" -- "$brief"
+    --allowedTools "Bash($python $script:*)" -- "$brief"
 )
 ```
 
@@ -94,7 +98,7 @@ For ordinary questions, the worker uses `record` and ends the turn. Present unre
 
 Use `ask --timeout <seconds>` only when the worker must continue in the same turn. Poll the existing shell job. If the command exits with code 124, end the turn and leave the question in the DB for the next turn. If a host already provides an App Server Plan-mode connection, its blocking `item/tool/requestUserInput` is another same-turn path. Keep the question and answer in the Dispatch record. Use the shell or next-turn workflow for regular `codex exec`.
 
-`wait` returns on `question`, `done`, `turn-ended`, `exited`, or timeout. Read current state on each return. Process pending questions and reports, reconcile exits, then reserve ready Tasks. Pass the returned cursor to `ack` after processing, even if the event list is empty. The cursor covers events that require no action, and a restart can replay unacknowledged actionable events.
+`wait` returns on a worker `question` or `done` event, or on timeout. Use the worker job's host completion notification to learn of exit and record `exited`. `turn-ended` and `exited` stay in the DB as coordinator reports and advance the cursor without triggering a wake. Read current state on each return. Process pending questions and reports, reconcile exits, then reserve ready Tasks. Pass the returned cursor to `ack` after processing, even if the event list is empty. A restart can replay unacknowledged actionable events.
 
 If worker activity is still expected, start `wait <run-id> --timeout 30` as a background Bash job on desktop and end the turn. The job's completion wakes the coordinator. In an active CLI coordinator, call `wait` to poll events and reconcile at the deadline. If the CLI coordinator has exited, explicitly resume it with `claude -p --resume <coordinator-session-id>` and identify the Run in the prompt.
 

@@ -267,6 +267,83 @@ class TeamUpTest(unittest.TestCase):
         self.exit_worker(dispatch, next_turn)
         self.assertIsNotNone(self.invoke("reserve", run, "--task", second))
 
+    def test_missing_session_can_be_recovered_after_a_question_turn_exits(self):
+        worktree = self.linked_worktree()
+        run = self.run_create()
+        task = self.task(run, "Recover the session from the worker log")
+        dispatch = self.invoke("reserve", run, "--task", task,
+                               "--worktree", worktree, "--branch", "assigned")["id"]
+        turn = self.begin(dispatch)
+        start = ("started", dispatch, "--turn", turn, "--runtime", "job-1")
+        self.invoke(*start)
+        question = self.invoke("record", dispatch, "--turn", turn, "Which path?")["id"]
+        self.invoke("answer", question, "Use path A")
+        ended = self.exit_worker(dispatch, turn)
+
+        recovered = self.invoke("started", dispatch, "--turn", turn, "--session", "logged-thread")
+        self.assertEqual(recovered, {**ended, "session": "logged-thread"})
+        self.assertEqual(self.invoke(*start, "--session", "logged-thread"), recovered)
+        self.invoke(*start, "--session", "different-thread", expected=1)
+        with sqlite3.connect(self.db) as db:
+            events = db.execute("SELECT data FROM events WHERE kind = 'session-recovered'").fetchall()
+        self.assertEqual([json.loads(data) for (data,) in events], [{"turn": turn, "session": "logged-thread"}])
+        self.assertEqual(self.begin(dispatch), turn + 1)
+        self.invoke(*start, "--session", "logged-thread", expected=1)
+
+    def test_missing_session_can_be_recovered_after_turn_ended_report(self):
+        run = self.run_create()
+        task = self.task(run, "Recover a logged thread before recording exit")
+        dispatch = self.invoke("reserve", run, "--task", task)["id"]
+        turn = self.begin(dispatch)
+        ended = self.invoke("turn-ended", dispatch, "--turn", turn)
+        recover = ("started", dispatch, "--turn", turn, "--session", "logged-thread")
+        self.invoke(*recover, "--unresumable", expected=1)
+        self.assertEqual(self.invoke(*recover), {**ended, "session": "logged-thread"})
+        self.exit_worker(dispatch, turn)
+        self.invoke(*recover, expected=1)
+
+    def test_worktree_checks_use_the_database_repository(self):
+        worktree = self.linked_worktree()
+        checkout = self.cwd
+        self.cwd = worktree
+        run = self.run_create()
+        self.cwd = checkout
+        self.invoke("init")
+        first = self.task(run, "Reserve an existing worktree")
+        second = self.task(run, "Register a host-created worktree")
+        third = self.task(run, "Check a worktree in the start report")
+        self.cwd = self.db.parent / "unrelated"
+        self.cwd.mkdir()
+        spec = ("--worktree", worktree, "--branch", "assigned")
+        self.invoke("reserve", run, "--task", first,
+                    "--worktree", worktree, "--branch", "wrong-branch", expected=1)
+        dispatch = self.invoke("reserve", run, "--task", first, *spec)["id"]
+        self.exit_worker(dispatch, self.begin(dispatch))
+
+        dispatch = self.invoke("reserve", run, "--task", second)["id"]
+        turn = self.begin(dispatch)
+        self.assertEqual(self.invoke("register", dispatch, "--turn", turn, *spec)["worktree"], str(worktree.resolve()))
+        self.exit_worker(dispatch, turn)
+
+        dispatch = self.invoke("reserve", run, "--task", third)["id"]
+        turn = self.begin(dispatch)
+        self.invoke("started", dispatch, "--turn", turn, "--runtime", "job-1", *spec)
+        self.report(dispatch, turn)
+        self.exit_worker(dispatch, turn)
+        self.invoke("delivered", dispatch)
+        self.assertEqual([item["id"] for item in self.invoke("cleanup", run)], [dispatch])
+
+        fourth = self.task(run, "Reserve a worktree before creating it")
+        planned = self.db.parent / "planned worktree"
+        dispatch = self.invoke("reserve", run, "--task", fourth,
+                               "--worktree", planned, "--branch", "planned")["id"]
+        self.invoke("begin", dispatch, expected=1)
+        subprocess.run(
+            ["git", "-C", str(checkout), "worktree", "add", "--quiet", "-b", "planned", str(planned)],
+            check=True, capture_output=True, timeout=30,
+        )
+        self.assertEqual(self.begin(dispatch), 1)
+
     def test_same_turn_ask_returns_answer_and_timeout_leaves_question(self):
         run = self.run_create()
         dispatch, turn = self.start(run, self.task(run, "Wait for an answer"))
@@ -339,11 +416,13 @@ class TeamUpTest(unittest.TestCase):
         dispatch, turn = self.start(run, self.task(run, "Keep working"))
         self.invoke("heartbeat", dispatch, "--turn", turn)
         self.invoke("instruct", dispatch, "Coordinator update")
+        self.invoke("turn-ended", dispatch, "--turn", turn)
+        self.exit_worker(dispatch, turn)
         timeout = 1
         started_at = time.monotonic()
         observed = self.invoke("wait", run, "--timeout", timeout)
+        self.assertEqual([event["kind"] for event in observed["events"]], [])
         self.assertGreaterEqual(time.monotonic() - started_at, timeout)
-        self.assertEqual(observed["events"], [])
         with sqlite3.connect(self.db) as db:
             last_event = db.execute("SELECT max(id) FROM events WHERE run_id = ?", (run,)).fetchone()[0]
         self.assertEqual(observed["cursor"], last_event)
@@ -371,10 +450,6 @@ class TeamUpTest(unittest.TestCase):
         self.assertGreater(replayed["cursor"], observed["cursor"])
         self.invoke("ack", run, replayed["cursor"])
         self.assertEqual(self.invoke("wait", run, "--timeout", 0), {"events": [], "cursor": replayed["cursor"]})
-        self.invoke("turn-ended", dispatch, "--turn", turn)
-        self.exit_worker(dispatch, turn)
-        events = self.invoke("wait", run, "--timeout", 0)["events"]
-        self.assertEqual([event["kind"] for event in events], ["turn-ended", "exited"])
 
     def test_wait_cursor_preserves_actionable_events_beyond_a_full_batch(self):
         run = self.run_create()

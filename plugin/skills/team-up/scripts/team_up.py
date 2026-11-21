@@ -15,8 +15,12 @@ import sys
 import time
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SCHEMA = """
+CREATE TABLE repository (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    common_dir TEXT NOT NULL
+);
 CREATE TABLE runs (
     id INTEGER PRIMARY KEY,
     goal TEXT NOT NULL,
@@ -129,11 +133,11 @@ def common_dir(directory=None):
     return Path(git("rev-parse", "--path-format=absolute", "--git-common-dir", directory=directory)).resolve()
 
 
-def database_path(args):
+def database_path(args, repo_common_dir=None):
     override = args.db or os.environ.get("TEAM_UP_DB")
     if override:
         return Path(override).expanduser().resolve()
-    repo_id = hashlib.sha256(os.fsencode(common_dir())).hexdigest()[:16]
+    repo_id = hashlib.sha256(os.fsencode(repo_common_dir or common_dir())).hexdigest()[:16]
     return Path.home() / ".local/state/default-stack/team-up" / f"{repo_id}.db"
 
 
@@ -147,7 +151,15 @@ def wal_reset_warning():
     return None
 
 
-def connect(path, create=False):
+def repository_common_dir(db):
+    row = db.execute("SELECT common_dir FROM repository WHERE id = 1").fetchone()
+    if row is None:
+        raise StateError("database is missing its repository identity")
+    return row[0]
+
+
+def connect(path, repo_common_dir=None):
+    create = repo_common_dir is not None
     if create:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         descriptor = os.open(path, os.O_CREAT | os.O_RDWR, mode=0o600)
@@ -166,6 +178,8 @@ def connect(path, create=False):
                     raise StateError("refusing to initialize an existing database with unknown objects")
             elif version != SCHEMA_VERSION:
                 raise StateError(f"database schema version {version} does not match {SCHEMA_VERSION}")
+            elif create and repository_common_dir(db) != str(repo_common_dir):
+                raise StateError("database belongs to a different repository")
         if create:
             if db.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
                 if db.execute("PRAGMA journal_mode=WAL").fetchone()[0] != "wal":
@@ -176,8 +190,11 @@ def connect(path, create=False):
                     for statement in SCHEMA.split(";"):
                         if statement.strip():
                             db.execute(statement)
+                    db.execute("INSERT INTO repository(id, common_dir) VALUES (1, ?)", (str(repo_common_dir),))
                     db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                     version = SCHEMA_VERSION
+                elif version == SCHEMA_VERSION and repository_common_dir(db) != str(repo_common_dir):
+                    raise StateError("database belongs to a different repository")
         if version != SCHEMA_VERSION:
             raise StateError(f"database schema version {version} does not match {SCHEMA_VERSION}")
     except BaseException:
@@ -352,8 +369,8 @@ def worktree_spec(args):
     return str(Path(args.worktree).expanduser().resolve()), args.branch
 
 
-def linked_worktrees():
-    records = git("worktree", "list", "--porcelain", "-z").split("\0\0")
+def linked_worktrees(db):
+    records = git("--git-dir", repository_common_dir(db), "worktree", "list", "--porcelain", "-z").split("\0\0")
     worktrees = {}
     # Git lists the repository's primary worktree first.
     for record in records[1:]:
@@ -365,8 +382,8 @@ def linked_worktrees():
     return worktrees
 
 
-def check_worktree(path, branch):
-    if not Path(path).is_dir() or linked_worktrees().get(path) != branch:
+def check_worktree(db, path, branch):
+    if not Path(path).is_dir() or linked_worktrees(db).get(path) != branch:
         raise StateError(f"expected a linked worktree at {path!r} on branch {branch!r}")
 
 
@@ -382,6 +399,8 @@ def check_worktree_claim(db, path, dispatch_id=None):
 
 def insert_dispatch(db, task, worktree, branch, attempt=1, retry_of=None):
     if worktree:
+        if Path(worktree).exists():
+            check_worktree(db, worktree, branch)
         check_worktree_claim(db, worktree)
     dispatch_id = db.execute(
         """INSERT INTO dispatches(task_id, attempt, retry_of, phase, worktree, branch, reserved_at)
@@ -452,7 +471,7 @@ def questions(db, dispatch):
 def begin(db, args):
     snapshot = dispatch_row(db, args.dispatch)
     if snapshot["worktree"]:
-        check_worktree(snapshot["worktree"], snapshot["branch"])
+        check_worktree(db, snapshot["worktree"], snapshot["branch"])
     with transaction(db):
         dispatch = dispatch_row(db, args.dispatch)
         if (dispatch["worktree"], dispatch["branch"]) != (snapshot["worktree"], snapshot["branch"]):
@@ -489,7 +508,7 @@ def save_worktree(db, dispatch, worktree, branch):
 
 def register(db, args):
     worktree, branch = worktree_spec(args)
-    check_worktree(worktree, branch)
+    check_worktree(db, worktree, branch)
     with transaction(db):
         save_worktree(db, current_turn(db, args), worktree, branch)
         return brief(db, args.dispatch)
@@ -498,15 +517,26 @@ def register(db, args):
 def started(db, args):
     worktree, branch = worktree_spec(args)
     if worktree:
-        check_worktree(worktree, branch)
+        check_worktree(db, worktree, branch)
     with transaction(db):
         dispatch = current_turn(db, args)
-        if dispatch["phase"] not in ("running", "turn-ended"):
-            raise StateError("start confirmation requires an active turn")
-        if dispatch["runtime"] and dispatch["runtime"] != args.runtime:
-            raise StateError("the turn already has a different runtime identity")
+        phase = dispatch["phase"]
+        if phase not in ("running", "turn-ended", "waiting"):
+            raise StateError("start confirmation requires a running, ended, or waiting turn")
+        if phase == "running" and args.runtime is None:
+            raise StateError("start confirmation for a running turn requires --runtime")
+        if args.runtime is not None and (phase == "waiting" or dispatch["runtime"]):
+            if dispatch["runtime"] != args.runtime:
+                raise StateError("the supplied runtime must match the recorded runtime identity")
         if dispatch["session"] and args.session and dispatch["session"] != args.session:
             raise StateError("the dispatch already has a different session identity")
+        if phase == "waiting" or args.runtime is None:
+            if args.session is None or worktree or args.unresumable:
+                raise StateError("session recovery requires --session without worktree or unresumable options")
+            if dispatch["session"] is None:
+                db.execute("UPDATE dispatches SET session = ? WHERE id = ?", (args.session, args.dispatch))
+                dispatch_event(db, dispatch, "session-recovered", session=args.session)
+            return brief(db, args.dispatch)
         if worktree:
             save_worktree(db, dispatch, worktree, branch)
         session = args.session or dispatch["session"]
@@ -715,7 +745,7 @@ def wait(db, args):
             cursor = max(cursor, run_row(db, args.run)["cursor"])
             events = [decode(row, "data") for row in db.execute(
                 """SELECT * FROM events WHERE run_id = ? AND id > ?
-                AND kind IN ('question', 'done', 'turn-ended', 'exited') ORDER BY id LIMIT 101""",
+                AND kind IN ('question', 'done') ORDER BY id LIMIT 101""",
                 (args.run, cursor),
             )]
             if len(events) > 100:
@@ -792,7 +822,7 @@ def cleanup(db, args):
     ).fetchall()
     if not rows:
         return []
-    worktrees = linked_worktrees()
+    worktrees = linked_worktrees(db)
     candidates = []
     for row in rows:
         path = row["worktree"]
@@ -879,8 +909,8 @@ def parser():
     command("begin", begin, "dispatch", writes=False)
     worktree_options(command("register", register, "dispatch", writes=False, turn=True), required=True)
     start = command("started", started, "dispatch", writes=False, turn=True)
-    start.add_argument("--runtime", type=nonempty, required=True)
-    start.add_argument("--session", type=nonempty)
+    start.add_argument("--runtime", type=nonempty, help="required for a running turn")
+    start.add_argument("--session", type=nonempty, help="may be recovered by itself after the turn ends")
     start.add_argument("--unresumable", action="store_true")
     worktree_options(start)
     command("turn-ended", turn_ended, "dispatch", turn=True)
@@ -913,8 +943,9 @@ def parser():
 def main(argv=None):
     args = parser().parse_args(argv)
     try:
-        path = database_path(args)
-        with closing(connect(path, create=args.command == "init")) as db:
+        repo_common_dir = common_dir() if args.command == "init" else None
+        path = database_path(args, repo_common_dir)
+        with closing(connect(path, repo_common_dir)) as db:
             if args.command == "init":
                 result = {"db": str(path), "schema_version": SCHEMA_VERSION,
                           "sqlite_version": sqlite3.sqlite_version,

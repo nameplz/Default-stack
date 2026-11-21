@@ -84,7 +84,9 @@ A1에서 셸 실행은 `yield_time_ms=1000`으로 시작해 세션 ID를 반환�
 |---|---|
 | 질문과 후속 지시 | 질문과 답변을 Dispatch에 연결해 DB에 저장한다. 워커는 질문을 기록한 뒤 턴을 종료한다. 답변을 받으면 저장된 스레드 ID로 같은 worktree에서 재개한다. Codex 시작과 재개에 `-s workspace-write --add-dir <state dir>`를 적용한다. 같은 턴 대기가 필요한 경우 자체 기한을 둔 셸 세션을 폴링하거나 App Server Plan 모드의 차단형 질문 RPC에 답한다. |
 | 코디네이터 깨우기와 재개 | CLI에서 실행 중인 코디네이터는 `wait`로 미처리 질문·완료 이벤트를 받아 DB에서 Run을 이어간다. 턴을 이미 종료한 코디네이터는 Run을 명시적으로 재개하고 워커 생존 여부와 미결 질문부터 확인한다. `claude -p --resume`의 문맥 복원은 코디네이터 재실행(B2 재실행)으로 확인했다. 데스크톱 앱의 종료 턴 자동 깨우기는 H3으로 확인했다. |
-| Claude 워커 DB 쓰기 | linked worktree의 `claude -p` 워커에는 `--allowedTools "Bash(python3 <team-up 스크립트>:*)"`를 지정한다. 쓰기 샌드박스가 켜져 있으면 상태 디렉터리를 허가하고, JSON `permission_denials`와 DB 행을 확인한다. `acceptEdits`만 지정하면 Bash 쓰기 명령이 거부될 수 있다. 데스크톱 사이드 세션과 앱 서브에이전트의 DB 쓰기는 H1·H2로 확인했다. [기존 DB 쓰기 검증](team-up-db-write.md) |
+| Claude 워커 DB 쓰기 | `claude -p`의 `--allowedTools`에 워커 명령의 따옴표 없는 Python·스크립트 접두사를 그대로 지정한다. Bash 호출당 DB 명령 하나를 실행한다. 쓰기 샌드박스가 켜져 있으면 상태 디렉터리를 허가하고, JSON `permission_denials`와 DB 행을 확인한다. `acceptEdits`만 지정하면 Bash 쓰기 명령이 거부될 수 있다. 데스크톱 사이드 세션과 앱 서브에이전트의 DB 쓰기는 H1·H2로 확인했다. [기존 DB 쓰기 검증](team-up-db-write.md) |
+
+후속 실동작 검증에서 `Bash(/usr/bin/python3 <script>:*)`는 스크립트 경로에 따옴표를 붙이거나 앞에 `cd … &&`를 붙인 명령을 거부했다. 두 경우 모두 `claude -p`의 종료 코드는 0이었고 결과 JSON의 `permission_denials`에 거부가 기록됐다. 따옴표 없는 경로로 `done`을 별도 Bash 호출에서 실행하자 DB에 완료가 기록됐고 `permission_denials`는 비어 있었다.
 
 ## 호스트 검증 (코디네이터 직접 실행)
 
