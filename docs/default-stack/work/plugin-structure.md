@@ -15,9 +15,10 @@ default-stack/                      # 저장소 루트 = 마켓플레이스 루�
 │   ├── .claude-plugin/
 │   │   └── plugin.json             # Claude Code 매니페스트
 │   ├── skills/
-│   │   └── <skill>/                # coffee-chat, apply-stack, ship-it, formal, explore
+│   │   └── <skill>/                # coffee-chat, apply-stack, ship-it, formal, explore, team-up
 │   │       ├── SKILL.md            # disable-model-invocation: true
-│   │       └── agents/openai.yaml  # policy.allow_implicit_invocation: false
+│   │       ├── agents/openai.yaml  # policy.allow_implicit_invocation: false
+│   │       └── scripts/            # team-up의 Python 스크립트와 tests/
 │   └── references/
 │       ├── docs-convention.md      # 문서 탐색·생성·갱신 규칙 (모든 스킬 공통)
 │       ├── coffee-chat.md          # 각 단계의 실행 절차
@@ -25,6 +26,7 @@ default-stack/                      # 저장소 루트 = 마켓플레이스 루�
 │       ├── ship-it.md
 │       ├── formal.md
 │       ├── explore.md
+│       ├── team-up.md
 │       └── pstack.md               # pstack 위치 찾기와 읽는 방법 (pstack을 쓰는 스킬 공통)
 ├── docs/default-stack/             # 이 설계 문서 (배포 대상 아님)
 ├── README.md
