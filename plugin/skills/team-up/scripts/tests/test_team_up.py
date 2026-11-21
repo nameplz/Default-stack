@@ -23,12 +23,14 @@ class TeamUpTest(unittest.TestCase):
         self.command = [sys.executable, "-B", str(SCRIPT), "--db", str(self.db)]
         self.cwd = REPO
 
-    def invoke(self, *args, expected=0):
+    def invoke(self, *args, expected=0, stderr=None):
         result = subprocess.run(
             [*self.command, *map(str, args)],
             cwd=self.cwd, capture_output=True, text=True, timeout=30,
         )
         self.assertEqual(result.returncode, expected, result.stderr or result.stdout)
+        if stderr is not None:
+            self.assertEqual(result.stderr, stderr)
         if expected == 0:
             return json.loads(result.stdout)
         return result
@@ -266,6 +268,25 @@ class TeamUpTest(unittest.TestCase):
         self.report(dispatch, next_turn)
         self.exit_worker(dispatch, next_turn)
         self.assertIsNotNone(self.invoke("reserve", run, "--task", second))
+
+    def test_missing_runtime_warns_without_discarding_turn_or_exit_reports(self):
+        run = self.run_create(slots=1)
+        task = self.task(run, "Finish without a recorded runtime handle")
+        dispatch = self.invoke("reserve", run, "--task", task)["id"]
+        turn = self.begin(dispatch)
+        self.report(dispatch, turn)
+        warning = f"team-up: warning: Dispatch {dispatch} turn {turn} has no runtime handle recorded with started\n"
+
+        ended = self.invoke("turn-ended", dispatch, "--turn", turn, stderr=warning)
+        self.assertEqual(ended["phase"], "turn-ended")
+        closed = self.invoke("exited", dispatch, "--turn", turn, "--code", 0, stderr=warning)
+        self.assertEqual(closed["phase"], "closed")
+        self.assertEqual(closed["outcome"], "success")
+
+        next_dispatch = self.invoke("reserve", run, "--task", self.task(run, "Fail to launch"))["id"]
+        next_turn = self.begin(next_dispatch)
+        failed = self.invoke("exited", next_dispatch, "--turn", next_turn, "--code", 1, "--start-failed", stderr="")
+        self.assertEqual(failed["outcome"], "start-failed")
 
     def test_missing_session_can_be_recovered_after_a_question_turn_exits(self):
         worktree = self.linked_worktree()

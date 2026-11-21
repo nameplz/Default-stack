@@ -964,6 +964,10 @@ def main(argv=None):
     except (StateError, sqlite3.Error, OSError, OverflowError) as exc:
         print(f"team-up: {exc}", file=sys.stderr)
         return 1
+    if (args.command in ("turn-ended", "exited") and result["runtime"] is None
+            and not getattr(args, "start_failed", False)):
+        print(f"team-up: warning: Dispatch {args.dispatch} turn {args.turn} "
+              "has no runtime handle recorded with started", file=sys.stderr)
     print(json.dumps(result, ensure_ascii=False))
     if args.command == "ask" and result["answer"] is None:
         return 124

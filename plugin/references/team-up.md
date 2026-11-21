@@ -32,14 +32,15 @@ Turn: <turn number>
 Worktree and branch: <absolute worktree path and branch>
 Goal: <deliverable>
 Edit only: <paths>
-Verify: <commands and expected evidence>
+Verify: <exact commands, one per Bash call, and expected evidence>
 State DB: <absolute DB path>
 Python: <selected executable>
 Script: <absolute script path used in the commands>
 
 Run each supplied command in its own Bash call from the assigned worktree.
-Keep the command prefix exactly as supplied. If blocked on a question, record
-it once and end the turn.
+Keep the command prefix exactly as supplied. If a required tool call is denied,
+record a question naming the denied tool and path or command. Record any blocking
+question once and end the turn.
 Finish with a done report containing the full result and verification evidence.
 Include the commit or exact diff you verified if you changed code.
 Leave Git staging, commits, and delivery to the coordinator.
@@ -80,17 +81,32 @@ If you missed the thread ID and the Dispatch is `turn-ended` or `waiting`, read 
 
 - On a desktop user turn, prefer the host's `start_session` side session in the prepared worktree. Store its session ID. On a question, confirm that the current turn is idle before recording its exit and keep the session open for the answer. Send the follow-up to that exact session. When the Dispatch finishes, use the host's session state and stop controls to verify shutdown before releasing the slot. For a preserved session, confirm that team-up's execution has ended and leave the idle session open.
 - On a desktop notification or session-message turn, use `Agent` with `isolation: worktree` or start a Codex worker for a compatible Task. Use the host-returned Agent ID and worktree. If the host discards a worktree or offers no way to resume the same Agent, report that blocker and confirm shutdown before considering a retry. On these turns a desktop side-session card needs a user action to start.
-- From the CLI, set `python` and `script` to the exact unquoted paths in the brief. Launch Claude in the assigned worktree with the Bash allow rule below. If Claude's Bash sandbox is enabled, include the absolute state directory in `sandbox.filesystem.allowWrite` for the worker launch. Save the returned `session_id`. Add `--resume "$session_id"` on the next turn in the same worktree and keep the allow rule and state-directory permission.
+- From the CLI, set `python` and `script` to the exact unquoted paths in the brief. Build the `--allowedTools` list from the worker's DB command prefix, the Task's `Edit only` paths, and its `Verify` commands. Add one exact `Bash(<command>)` rule per verification command. Leave out edit rules for read-only Tasks. If Claude's Bash sandbox is enabled, include the absolute state directory in `sandbox.filesystem.allowWrite` on launch and resume. Save the returned `session_id`.
+
+In `claude -p`, `--allowedTools` accepts path-scoped `Edit` rules that cover both `Edit` and `Write`. Use paths relative to the worker's worktree, such as `Edit(./src/**)`. For an absolute path, use `Edit(//path/to/worktree/src/**)`. [Print-mode allow rules](https://code.claude.com/docs/en/headless#create-a-commit) [File permission patterns](https://code.claude.com/docs/en/permissions#read-and-edit)
+
+For a Task that allows edits under `src/` and `artifacts/` and lists `make verify` on its `Verify` line, use these rules in Bash or Zsh.
+
+```sh
+allowed_tools=("Bash($python $script:*)" "Edit(./src/**)" "Edit(./artifacts/**)" "Bash(make verify)")
+(
+  cd "$worktree" || exit
+  claude -p --output-format json \
+    --allowedTools "${allowed_tools[@]}" -- "$brief"
+)
+```
+
+Resume in the same worktree. Reapply the rules for the follow-up brief.
 
 ```sh
 (
   cd "$worktree" || exit
-  claude -p --output-format json \
-    --allowedTools "Bash($python $script:*)" -- "$brief"
+  claude -p --output-format json --resume "$session_id" \
+    --allowedTools "${allowed_tools[@]}" -- "$brief"
 )
 ```
 
-Check JSON `permission_denials` and the corresponding DB writes even if the command exits with code 0. Preserve the JSON output in the worker log and investigate permission errors before retrying.
+After each turn, the coordinator must check JSON `permission_denials` and the corresponding DB writes, even if Claude exits with code 0. A denial that blocks the Task becomes a worker question. If the denial also prevents the worker from recording its question, use the saved JSON to identify the blocker. Preserve the JSON output in the worker log and resolve the permission issue before resuming.
 
 ## Process questions and wake events
 
@@ -99,6 +115,8 @@ For ordinary questions, the worker uses `record` and ends the turn. Present unre
 Use `ask --timeout <seconds>` only when the worker must continue in the same turn. Poll the existing shell job. If the command exits with code 124, end the turn and leave the question in the DB for the next turn. If a host already provides an App Server Plan-mode connection, its blocking `item/tool/requestUserInput` is another same-turn path. Keep the question and answer in the Dispatch record. Use the shell or next-turn workflow for regular `codex exec`.
 
 `wait` returns on a worker `question` or `done` event, or on timeout. Use the worker job's host completion notification to learn of exit and record `exited`. `turn-ended` and `exited` stay in the DB as coordinator reports and advance the cursor without triggering a wake. Read current state on each return. Process pending questions and reports, reconcile exits, then reserve ready Tasks. Pass the returned cursor to `ack` after processing, even if the event list is empty. A restart can replay unacknowledged actionable events.
+
+If the current turn has no runtime handle, `turn-ended` and `exited` warn on stderr and still save the report. This lets you record a confirmed exit after a missed `started`. An `exited --start-failed` report has no runtime warning.
 
 If worker activity is still expected, start `wait <run-id> --timeout 30` as a background Bash job on desktop and end the turn. The job's completion wakes the coordinator. In an active CLI coordinator, call `wait` to poll events and reconcile at the deadline. If the CLI coordinator has exited, explicitly resume it with `claude -p --resume <coordinator-session-id>` and identify the Run in the prompt.
 

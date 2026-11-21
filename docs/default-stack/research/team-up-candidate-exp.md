@@ -88,6 +88,10 @@ A1에서 셸 실행은 `yield_time_ms=1000`으로 시작해 세션 ID를 반환�
 
 후속 실동작 검증에서 `Bash(/usr/bin/python3 <script>:*)`는 스크립트 경로에 따옴표를 붙이거나 앞에 `cd … &&`를 붙인 명령을 거부했다. 두 경우 모두 `claude -p`의 종료 코드는 0이었고 결과 JSON의 `permission_denials`에 거부가 기록됐다. 따옴표 없는 경로로 `done`을 별도 Bash 호출에서 실행하자 DB에 완료가 기록됐고 `permission_denials`는 비어 있었다.
 
+두 번째 실동작 검증에서는 DB 명령만 허용한 Claude Haiku 워커의 `Write` 호출 두 건이 거부됐다. 종료 코드는 0이었고 워커는 질문을 기록했다. 재개 시 `Write`, `Edit`, `Bash(/usr/bin/python3 -m unittest:*)`를 추가하자 워커가 거부 없이 작업을 완료했다. 가이드는 `Edit only` 경로와 `Verify`의 명령을 기준으로 허가 범위를 지정한다. 경로 한정 `Edit` 규칙의 근거는 Anthropic 문서다. [Print 모드의 허가 규칙](https://code.claude.com/docs/en/headless#create-a-commit) [파일 권한 패턴](https://code.claude.com/docs/en/permissions#read-and-edit)
+
+같은 검증에서 코디네이터가 `started`를 누락하자 Dispatch가 `runtime` 없이 닫혔다. `turn-ended`와 `exited`에 경고를 추가했다. 호스트에서 종료를 확인한 경우 보고를 저장할 수 있다.
+
 ## 호스트 검증 (코디네이터 직접 실행)
 
 2026-11-21, Claude 데스크톱 앱 Code 탭. 코디네이터가 WAL로 초기화한 테스트 DB(`~/.local/state/default-stack-test/host.db`)에 각 워커가 stdlib 스크립트로 완료 행을 썼다. 권한 모드는 auto.
