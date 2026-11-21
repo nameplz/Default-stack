@@ -1,6 +1,6 @@
 ---
 name: team-up
-description: Coordinate Claude and Codex workers in separate local Git worktrees from Claude Code. Run only when the user invokes it.
+description: Coordinate Claude and Codex workers in local Git worktrees or assign read-only reviews of the main checkout from Claude Code. Run only when the user invokes it.
 disable-model-invocation: true
 ---
 

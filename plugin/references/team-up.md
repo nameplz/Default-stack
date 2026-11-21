@@ -12,11 +12,19 @@ Use one Claude coordinator for one active Run in one local Git repository. Start
 
 Use the local script's `--help` for command arguments. The examples put `--db` before the subcommand. Replace the shell variables and example values with the actual Run values. Replace the example `python3` with the selected executable if you use a different one.
 
+Schema v3 requires a new DB if `init` reports schema v2. Keep the old DB for its Run history and pass a new absolute `--db` path to `init`.
+
+## Record a gate decision
+
+Map a clear user approval to `gate <run-id> <name> --decision approve` and a clear rejection to `--decision reject`. Put the user's explanation in `--note <text>`. Ask for clarification if the answer gives neither decision. Leave the gate undecided while you wait.
+
+A rejected Task stays blocked. If the user later approves the same gate, record `--decision approve` and check the Task's other prerequisites before reserving. This lets the user revisit a decision without recreating Tasks or dependencies. Approval is final for that gate because dependent work may already have started.
+
 ## Reserve before launching
 
 Use `reserve <run-id>` to check Task dependencies, decision gates, and slot capacity. Use `--task <task-id>` when selecting a specific Task. The command returns `null` and exits with code 0 if no slot or eligible Task is available. Launch only when the command returns a Dispatch. Keep its Task ID, Dispatch ID, and attempt number.
 
-Use a distinct worktree and branch for each worker. For CLI workers and desktop side sessions, reserve the intended path and branch with `--worktree` and `--branch`. Create that worktree from the appropriate base revision and verify it against `git worktree list --porcelain`. For a host-created worktree, use `register` to record the assigned path and branch as soon as they become available.
+Use a distinct linked worktree and branch for each worker that edits. For CLI workers and desktop side sessions, reserve the intended path and branch with `--worktree` and `--branch`. Create that worktree from the appropriate base revision and verify it against `git worktree list --porcelain`. For a host-created worktree, use `register` to record the assigned path and branch as soon as they become available. Use the [main checkout review procedure](#review-the-live-patch-in-the-main-checkout) when a Task needs the user's uncommitted changes.
 
 Call `begin <dispatch-id>` immediately before starting or resuming the worker. Use the returned turn in the brief and in later host reports. Use `started --runtime <handle>` to save the process or tool handle. For a PID, include its process start identity. Save `--session <id>` when the host returns it. If the coordinator stops before recording the handle, leave the slot reserved until you can establish whether the worker started. Use a background shell-tool job or another host-owned handle that can observe the process exit. Save each worker's output under the state directory with the Dispatch ID and turn in the filename.
 
@@ -80,7 +88,7 @@ codex exec -C "$worktree" -s workspace-write --add-dir "$state_dir" \
 
 Record `turn.completed` or `turn.failed` with `turn-ended` when observed. After the host confirms process exit, call `exited` with the actual exit code. Check the DB for a `done` report before treating the Task as complete.
 
-If you missed the thread ID and the Dispatch is `turn-ended` or `waiting`, read `thread.started` from the saved JSONL. Fill the missing ID for the current turn with `started <dispatch-id> --turn <turn> --session <thread-id>` before resuming.
+If you missed the thread ID and the Dispatch is `turn-ended`, `waiting`, or closed with a completion report, read `thread.started` from the saved JSONL. Fill the missing ID for the current turn with `started <dispatch-id> --turn <turn> --session <thread-id>` before resuming.
 
 ### Claude worker
 
@@ -132,9 +140,69 @@ Resume in the same worktree. Reapply the rules for the follow-up brief.
 
 After each turn, the coordinator must check JSON `permission_denials` and the corresponding DB writes, even if Claude exits with code 0. A denial that blocks the Task becomes a worker question. If the denial also prevents the worker from recording its question, use the saved JSON to identify the blocker. Preserve the JSON output in the worker log and resolve the permission issue before resuming.
 
+## Review the live patch in the main checkout
+
+Reserve a read-only Task with `reserve <run-id> --task <task-id> --review-main --worktree "$review_checkout" --branch "$review_branch"`. Use the primary checkout's absolute physical path and current branch. Set `state_dir` to a dedicated directory outside any Git checkout, with no overlap with the review checkout or its Git directory. Use an absolute DB path in that directory and save the brief and worker logs there.
+
+Use CLI workers for this placement, including from a desktop coordinator. Give the worker `git -C "$review_checkout" --no-optional-locks status --short --untracked-files=all` and `git -C "$review_checkout" --no-pager diff --no-ext-diff --no-textconv --binary HEAD` with concrete paths in the brief. Tell the worker to read the live files and report findings with `changed_code: false`. Use `record` for a blocking question and the same session ID for the next turn.
+
+For Codex CLI 0.170.0, set a permission profile on both launches. It grants read access and gives SQLite write access to the state directory, including its WAL and shared-memory files. The built-in `read-only` mode blocks the DB write. Start Codex from the state directory so it does not load the review checkout's project configuration. [Codex permission profiles](https://github.com/openai/codex/blob/rust-v0.170.0/codex-rs/core/src/config/permissions.rs)
+
+```sh
+review_profile=$("$python" -c '
+import json, sys
+state_dir = json.dumps(sys.argv[1], ensure_ascii=False)
+print("permissions.team-up-review.filesystem={\":root\"=\"read\", " + state_dir + "=\"write\"}")
+' "$state_dir")
+codex_review=(
+  --ignore-user-config --ignore-rules --skip-git-repo-check -C "$state_dir"
+  -c 'approval_policy="never"'
+  -c 'default_permissions="team-up-review"'
+  -c "$review_profile"
+)
+codex exec "${codex_review[@]}" --json - < "$brief_file"
+codex exec "${codex_review[@]}" resume --json "$thread_id" - < "$brief_file"
+```
+
+For Claude Code 2.1.330, supply the Bash sandbox settings inline. Use `denyWrite` for the checkout and Git common directory and `allowWrite` for the state directory. Limit built-in tools to Bash and file reads and load no MCP servers. The example assumes shell-safe paths in the Bash allow rules. Use the same shell-safe path spelling in the brief. The Bash sandbox must be available on the host. [Claude Bash sandbox settings](https://code.claude.com/docs/en/sandboxing)
+
+```sh
+review_git_dir=$(git -C "$review_checkout" rev-parse --path-format=absolute --git-common-dir)
+review_settings=$("$python" -c '
+import json, sys
+print(json.dumps({"sandbox": {
+    "enabled": True, "failIfUnavailable": True, "allowUnsandboxedCommands": False,
+    "autoAllowBashIfSandboxed": False,
+    "filesystem": {"denyWrite": sys.argv[1:3], "allowWrite": [sys.argv[3]]},
+}}))
+' "$review_checkout" "$review_git_dir" "$state_dir")
+claude_review=(
+  -p --output-format json --restricted --tools 'Bash,Read,Glob,Grep'
+  --permission-mode dontAsk --setting-sources '' --settings "$review_settings" --strict-mcp-config
+  --allowedTools
+  "Bash($python $script --db $db:*)"
+  "Bash(git -C $review_checkout --no-optional-locks status --short --untracked-files=all)"
+  "Bash(git -C $review_checkout --no-pager diff --no-ext-diff --no-textconv --binary HEAD)"
+)
+(
+  cd "$review_checkout" || exit
+  claude "${claude_review[@]}" -- "$brief"
+)
+(
+  cd "$review_checkout" || exit
+  claude --resume "$session_id" "${claude_review[@]}" -- "$brief"
+)
+```
+
+Use the same sandbox rules for each resumed turn. If the required sandbox or tool permissions are unavailable, stop the review and report the blocker. The Bash allow rules are not a write boundary: a later `--db` argument matches the DB rule, so only the sandbox keeps writes out of the checkout. Treat a worker's report of what it ran as unverified and check the command and exit code in the Codex JSONL or the Claude tool log. Compare the working-tree status and patch around delivery. Deliver the findings and verification evidence and record `delivered`. The main checkout is excluded from `cleanup`.
+
 ## Process questions and wake events
 
 For ordinary questions, the worker uses `record` and ends the turn. Present unresolved questions to the user. Save the answer with `answer` and include it in the follow-up brief. Use `instruct` to store other follow-up instructions against the same Dispatch before sending them. Resume the same session and worktree after confirming that the previous turn has ended. Include the new turn number in worker commands. A Dispatch waiting for an answer still owns its slot.
+
+Use `instruct <dispatch-id> <text>` to queue instructions during a turn, after `done`, or after confirmed exit. Instructions added during a turn remain pending when that turn reports `done`. To follow up on a completed Dispatch, record its exit with `exited` and call `begin <dispatch-id>` when a slot is available. Use the same session and checkout. Include the pending instructions from `messages` with `kind: "instruction"` and `consumed: 0`, along with the new turn number. A completion in a later turn marks the instructions from its brief consumed. Use the new completion report for delivery. The `completion-followed-up` event retains the previous report.
+
+An unanswered question from a turn that reported `done` is stale and `answer` refuses it. If the user wants the answer acted on, restate it as an `instruct` follow-up. Keep a completed worktree available if a follow-up is pending. For a Dispatch you cannot resume, report the reason and use the stored instructions to brief any replacement.
 
 Use `ask --timeout <seconds>` only when the worker must continue in the same turn. Poll the existing shell job. If the command exits with code 124, end the turn and leave the question in the DB for the next turn. If a host already provides an App Server Plan-mode connection, its blocking `item/tool/requestUserInput` is another same-turn path. Keep the question and answer in the Dispatch record. Use the shell or next-turn workflow for regular `codex exec`.
 
@@ -148,7 +216,7 @@ If worker activity is still expected, start `wait <run-id> --timeout 30` as a ba
 
 - Treat an overdue heartbeat as a prompt to inspect the saved handle and start identity. Check the host or supervisor for current liveness. Keep the slot and worktree reserved while liveness is unknown.
 - Use `stop` to record a request. Ask the host to stop only the worker owned by that Dispatch. After confirmed termination, record `exited --stopped` with the current turn and exit code. If the user abandons an assignment, use `abandon --reason` and continue checking the worker until shutdown is confirmed.
-- If launch fails, use `exited --start-failed` after confirming there is no live worker. Use `retry` on a failed or incomplete Dispatch only after confirmed termination. The new Dispatch records the previous ID as `retry_of` and increments the attempt number. Give the replacement a new worktree and preserve any undelivered work in the old checkout. Defer retries for permission or installation failures until the cause changes.
+- If launch fails, use `exited --start-failed` after confirming there is no live worker. Use `retry` on a failed or incomplete Dispatch only after confirmed termination. The new Dispatch records the previous ID as `retry_of` and increments the attempt number. For linked placements, give the replacement a new worktree and preserve any undelivered work in the old worktree. For a main checkout review, leave out the worktree options to reuse the recorded placement and apply the review permissions again. Defer retries for permission or installation failures until the cause changes.
 - After three start failures for a Task, report the cause to the user. Use `retry <dispatch-id> --override` only when the user confirms the cause has changed and instructs you to retry. The override allows one attempt and records a `retry-override` event.
 - A turn event or process exit alone does not complete a Task. A normal turn that records a question stays available for an answer. A worker that exits without a report or a resumable question leaves the Task incomplete.
 
@@ -156,7 +224,7 @@ If worker activity is still expected, start `wait <run-id> --timeout 30` as a ba
 
 1. After confirming worker exit, read the completion report and check the branch and verification evidence. Check the full worktree status against the Task's edit scope. For working-tree changes, rerun the brief's Git commands and compare their patch output with the worker's report before staging. Deliver the branch, commit or diff, and verification evidence to the user and record delivery. For PR delivery, hand off to [ship-it](ship-it.md) when the user invokes it. For a merge dependency, confirm the required `verify` check passed and the specified default branch contains the needed change before recording the merge.
 2. Use `takeover` or `keep-open` before handing control to the user. Preserve the session and worktree in either case. Once the user takes over, stop sending instructions to the worker. Keep tracking the active turn until the host confirms it ended.
-3. Use `cleanup` to list candidates with confirmed exit and recorded delivery. Retain worktrees without a report for manual reconciliation. Before removing a candidate, confirm team-up ownership and worker exit. Recheck the recorded path and branch against Git. Check `git status --porcelain --untracked-files=all` in the worktree and confirm all results are delivered. Skip any worktree with changes, an unknown worker state, or a preservation request. If the host already removed the worktree, reconcile that with Git instead of substituting another path.
+3. Use `cleanup` to list linked worktree candidates with confirmed exit, recorded delivery, and no pending instructions. Retain worktrees without a report for manual reconciliation. Before removing a candidate, confirm team-up ownership and worker exit. Recheck the recorded path and branch against Git. Check `git status --porcelain --untracked-files=all` in the worktree and confirm all results are delivered. Skip any worktree with changes, an unknown worker state, or a preservation request. If the host already removed the worktree, reconcile that with Git instead of substituting another path.
 4. Use regular `git worktree remove` after the checks pass. Preserve the branch, durable evidence, and DB. Delete the DB only on an explicit user request.
 
 ## Limits

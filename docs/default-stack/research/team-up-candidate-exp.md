@@ -107,3 +107,23 @@ A1에서 셸 실행은 `yield_time_ms=1000`으로 시작해 세션 ID를 반환�
 세 번째 실동작 검증에서는 Claude Haiku 워커에 DB 명령, `Edit(./greet.py)`, `Edit(./test_greet.py)`, `Bash(/usr/bin/python3 -m unittest)`를 허용했다. 지정 파일 수정은 성공했고 범위 밖 `probe.txt` 쓰기는 거부됐다. `git status --short`와 파일별 `git diff --no-index`를 묶은 셸 호출도 거부되어 `permission_denials`에 기록됐다. 워커가 직접 작성한 diff는 Git 출력으로 확인할 수 없었다.
 
 가이드는 검증 뒤 실행할 읽기 전용 Git 명령을 편집 범위에 맞춰 브리프에 명시한다. Claude CLI는 명령별 정확한 Bash 허가를 추가하고, Claude·Codex 워커는 명령을 한 번에 하나씩 실행해 Git 출력을 완료 증거에 넣는다. 코디네이터는 워커 종료 뒤 같은 diff를 재생성해 대조한다. 이 절차는 Git 인덱스에 파일을 추가하지 않는다.
+
+## 기본 체크아웃 리뷰의 권한
+
+Codex CLI 0.170.0의 `codex exec --help`는 `read-only`를 셸 샌드박스 모드로, `--add-dir`을 기본 작업 영역에 더하는 쓰기 디렉터리로 설명한다. 이 리뷰에는 상태 디렉터리에만 쓰기를 부여하는 별도 권한 프로필을 쓴다. 시작과 재개 모두 같은 프로필을 지정한다. Codex 소스의 프로필 해석과 시작·재개 요청 코드를 확인했다. [Codex 프로필 소스](https://github.com/openai/codex/blob/rust-v0.170.0/codex-rs/core/src/config/permissions.rs) [Codex exec 소스](https://github.com/openai/codex/blob/rust-v0.170.0/codex-rs/exec/src/lib.rs)
+
+Claude Code 2.1.330의 `claude --help`에서 인라인 `--settings`, `--restricted`, `--tools`, `--resume`을 확인했다. Bash 샌드박스는 체크아웃과 Git common dir의 쓰기를 차단하고 상태 디렉터리의 쓰기를 허용한다. 도구 목록에서 편집 도구를 제외한다. OS 제한 구현은 Anthropic의 Apache-2.0 sandbox-runtime을 참고했다. 실행에 새 의존성을 추가하지 않았다. [Claude 샌드박스 설정](https://code.claude.com/docs/en/sandboxing) [sandbox-runtime 소스와 라이선스](https://github.com/anthropics/sandbox-runtime)
+
+`verify-team-up`의 `review-main`은 셸 역할로 같은 Dispatch와 세션 ID의 재개, DB 쓰기, 리뷰 전달, 패치 일치를 확인했다. 호스트별 샌드박스의 실제 쓰기 차단과 모델 세션 재개는 이번에 실동작으로 검증하지 않았다.
+
+네 번째 실동작 검증(2026-11-21, Codex CLI 0.170.0, Claude Code `--model haiku`)에서는 가이드의 `codex_review`와 `claude_review` 배열 그대로 두 워커를 실행했다. 임시 저장소의 미커밋 `calc.py` 버그를 리뷰했고 상태 디렉터리는 체크아웃 밖에 두었다. Run 하나, 슬롯 1에서 Codex 리뷰 Dispatch 뒤 Claude 리뷰 Dispatch를 진행했다. 각 첫 턴은 Status·Diff 확인, 체크아웃 쓰기 시도 한 번, 질문 `record`였다. 코디네이터가 `answer`하고 `begin`으로 두 번째 턴을 열었으며, 워커는 Diff를 다시 실행하고 `changed_code: false`로 `done`을 기록했다.
+
+| 항목 | 실제 | 결과 |
+|---|---|---|
+| DB 쓰기와 재개 | 두 워커 모두 `record`와 `done`이 상태 디렉터리의 DB에 기록. Codex는 `thread.started`의 ID로, Claude는 같은 `session_id`로 재개. 두 Dispatch 모두 success로 종료. Claude `permission_denials=[]` | 통과 |
+| 라이브 패치 | 전후 패치가 바이트 단위로 같고 상태는 ` M calc.py`만 표시 | 통과 |
+| Claude 쓰기 시도 | `$python $script --db $db --db <checkout>/probe-claude.db init`. 허가 규칙 `Bash($python $script --db $db:*)`의 접두사와 일치하고 argparse는 마지막 `--db`를 사용. Bash 샌드박스가 `Operation not permitted`로 거부 | 샌드박스로 차단 |
+| Codex 쓰기 시도 | 브리프의 `/usr/bin/touch <checkout>/probe-codex.txt`를 JSONL상 실행하지 않음. 메시지와 증거는 "Operation not permitted로 실패"라고 보고했고, 관계없는 xcrun 캐시 경고를 근거로 쓴 것으로 보임. 브리프의 체크아웃 수정 금지 규칙과 시도 지시가 충돌 | 워커 보고 불일치 |
+| Codex 프로필 직접 확인 | `codex sandbox -c 'default_permissions="team-up-review"' -c "$review_profile" -P team-up-review -C "$state_dir" -- /usr/bin/touch <path>`. 체크아웃과 `.git`은 `Operation not permitted`, exit 1. 상태 디렉터리는 exit 0. 프로필 안의 명령은 DARWIN_USER_TEMP_DIR 관련 `confstr()`·`xcrun_db` 경고를 출력하나 결과에 영향 없음 | 통과 |
+
+허가 규칙의 접두사는 쓰기 경계가 아니다. 체크아웃과 Git 디렉터리의 `denyWrite` 샌드박스가 필수다. 워커가 보고한 실행 내용은 증거가 아니므로 코디네이터는 JSONL이나 도구 로그에서 명령과 종료 코드를 확인한다. Claude 워커의 `.git` 쓰기 시도, 리뷰 Dispatch 여러 개의 동시 실행, 데스크톱 코디네이터 실행은 검증하지 않았다.
