@@ -194,7 +194,7 @@ claude_review=(
 )
 ```
 
-Use the same sandbox rules for each resumed turn. If the required sandbox or tool permissions are unavailable, stop the review and report the blocker. Compare the working-tree status and patch around delivery. Deliver the findings and verification evidence and record `delivered`. The main checkout is excluded from `cleanup`.
+Use the same sandbox rules for each resumed turn. If the required sandbox or tool permissions are unavailable, stop the review and report the blocker. The Bash allow rules are not a write boundary: a later `--db` argument matches the DB rule, so only the sandbox keeps writes out of the checkout. Treat a worker's report of what it ran as unverified and check the command and exit code in the Codex JSONL or the Claude tool log. Compare the working-tree status and patch around delivery. Deliver the findings and verification evidence and record `delivered`. The main checkout is excluded from `cleanup`.
 
 ## Process questions and wake events
 
