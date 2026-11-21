@@ -24,6 +24,21 @@
 | 기본 브랜치에는 PR로만 반영. 필수 검사 `verify`만 통과하면 리뷰 없이 자동 병합 | Lauren 방식: 검사가 게이트, 사람 리뷰는 병목. 필수 검사 없는 자동 병합은 즉시 병합이므로 ship-it이 먼저 확인 |
 | 형식 검증(`formal`)과 릴리스별 탐색(`explore`)을 apply-stack 기반 위의 별도 스킬로 둠. explore는 버그마다 PR 하나, 실행당 PR 최대 5개 | 기반(verify, 검증 스킬, 자동 병합)이 있어야 동작. 버그를 묶으면 되돌리기 어려움 |
 | 반복 지적 규칙은 hook이 아니라 apply-stack이 프로젝트 `AGENTS.md`에 넣음 | `hooks/` 미사용 원칙 유지. 규칙이 저장소와 함께 이동 |
+| `team-up` 코디네이터는 Claude 데스크톱 앱 Code 탭과 Claude Code CLI에서 지원, Codex는 워커로만 지원. Claude·Codex 워커별 Git worktree 배정, Run·Task·Dispatch 상태는 SQLite에 기록 | 두 호스트에서 로컬 워커 조율과 진행 상태 보존 |
+| 상태 DB는 `~/.local/state/default-stack/team-up/<repo-id>.db`. `git rev-parse --path-format=absolute --git-common-dir` 결과의 `realpath`를 해시해 `<repo-id>`를 구함 | Codex 샌드박스가 `.git`을 보호함. 메인 체크아웃과 linked worktree에서 같은 ID를 확인 ([DB 쓰기 검증](research/team-up-db-write.md)) |
+| Codex 워커는 지정된 worktree에서 `codex exec --json`으로 시작. `thread.started`의 ID와 worktree를 기록하고 같은 worktree에서 해당 ID로 `codex exec resume` 실행. 시작·재개에 `-s workspace-write --add-dir <state dir>` 적용 | [Codex 실행 방식](research/chatgpt-desktop-app.md), [DB 쓰기 검증](research/team-up-db-write.md) |
+| 데스크톱 코디네이터는 사용자 턴에서 Claude 워커 배정 시 사이드 세션 우선. 알림이나 다른 세션 메시지로 시작된 턴에서는 사이드 세션 시작 불가. 자동 후속 배정은 worktree 서브에이전트 또는 `codex exec` 사용. CLI Claude 워커는 `claude -p`의 `--allowedTools`로 team-up 스크립트 허용, 샌드박스 사용 시 `sandbox.filesystem.allowWrite`에 상태 디렉터리 추가. 결과 JSON의 `permission_denials`와 DB 기록 확인 | 데스크톱 사이드 세션·worktree 서브에이전트의 DB 쓰기 확인. `claude -p`는 Bash 사용이 거부돼도 종료 코드 0 가능. [후보 실험·호스트 검증](research/team-up-candidate-exp.md), [DB 쓰기 검증](research/team-up-db-write.md) |
+| `skills/team-up/scripts/`에 Python 표준 라이브러리만 쓰는 스크립트 포함. 스킬 문서는 상대경로로 참조, 코디네이터는 스킬 위치에서 계산한 실행 경로를 워커 브리프에 명시. 워커에게 스크립트로 DB를 갱신하도록 지시 | 스킬 내부에 실행 절차 배포. `--add-dir`는 디렉터리 쓰기 권한 부여, 스크립트 사용은 워커 지침 |
+| 코디네이터만 DB를 초기화하고 WAL 모드와 스키마를 설정. 워커는 연결 직후 `busy_timeout`을 설정하고 기존 저널 모드를 유지 | 새 DB에서 동시에 WAL 모드로 전환하자 `database is locked`로 250행 중 200행만 기록. 코디네이터가 먼저 초기화한 뒤 3회 모두 250행 기록 ([DB 쓰기 검증](research/team-up-db-write.md)) |
+| `team-up`에 기존 명시 호출 정책 적용. 전환 시 사용자 환경의 `~/.agents/skills/orchestration` 스텁 비활성화. Dispatch를 받은 워커는 브리프에 지정된 명령 실행 | 자연어 위임 요청으로 기존 Orca 스텁이 실행되는 경로 제거 |
+| Run별 Task 의존성과 사용자 결정 게이트 저장. 선행 작업·게이트·가용 슬롯 확인과 Dispatch 예약을 하나의 `BEGIN IMMEDIATE` 트랜잭션으로 처리한 뒤 워커 시작. 부분 유일 인덱스로 Task당 열린 Dispatch 하나만 허용. 브리프에 Task·Dispatch ID, 목표, 수정 범위, 완료 증거 명시 | 중복 배정 방지와 재개 시 배정 범위 복원. [OSS 조사](research/team-up-oss.md) |
+| 질문·답변·후속 지시는 Dispatch에 연결해 DB에 기록. 워커는 질문 기록 후 턴 종료, 답변 수신 후 같은 worktree에서 같은 스레드로 재개. Codex 시작과 재개에 `-s workspace-write --add-dir <state dir>` 재지정. 같은 턴 대기가 필요할 때만 자체 기한을 둔 셸 `ask` 또는 App Server Plan 모드의 차단형 질문 사용 | 동일 스레드 재개·DB 쓰기와 두 가지 같은 턴 응답 경로 확인. Codex 셸 도구의 최대 대기 시간은 미검증. [후보 실험](research/team-up-candidate-exp.md) |
+| `done --evidence`로 성공·실패, 결과 전문, 검증 명령·종료 코드·결과 위치 기록. 코드 변경 시 검증한 커밋 또는 diff 명시. 코디네이터는 시작·턴 종료·프로세스 종료·Task 완료를 구분. 완료 보고 없이 끝난 배정은 미완료 처리, 질문만 남긴 정상 턴은 답변 대기로 복구 | 완료 보고와 실행 종료의 독립 판정. [OSS 조사](research/team-up-oss.md) |
+| 상태 전이와 이벤트를 DB에 함께 커밋. 데스크톱 코디네이터는 백그라운드 `wait`로 새 턴 시작. 실행 중인 CLI 코디네이터는 `wait`로 미처리 이벤트 조회, 종료한 CLI 코디네이터는 `claude -p --resume`으로 Run을 명시 재개. 재개 시 워커 생존 상태와 미결 질문 확인, 이후 선행 조건을 충족한 Task 배정 | 데스크톱 자동 깨우기와 `claude -p --resume` 문맥 복원 확인. CLI 백그라운드 `wait` 자동 깨우기는 미검증. [후보 실험·호스트 검증](research/team-up-candidate-exp.md), [OSS 조사](research/team-up-oss.md) |
+| team-up 소유 워커에 중지 요청, heartbeat 만료 시 생존 상태 재확인. 워커 종료를 확인한 뒤에만 재시도와 슬롯 재배정. 종료 미확인 상태에서는 정리도 보류. 재시도에 `retry_of`와 시도 번호 기록, 활성 Dispatch의 보고만 수락. 같은 체인의 시작 실패 3회에서 자동 재시도 중단. 배정 포기는 사용자 요청으로 기록하고 워커 생존 상태는 계속 확인 | 중복 워커와 재시도 루프 방지. [OSS 조사](research/team-up-oss.md) |
+| 사용자 인수 또는 keep-open 표시가 있는 세션·worktree 보존. team-up 소유 worktree는 경로·브랜치 일치와 워커 종료를 확인하고 미커밋 변경·미전달 결과·보존 요청이 없을 때 정리. DB는 명시적 삭제 요청까지 보존 | 사용자 작업과 재개 기록 보호. 외부 Codex 스레드의 데스크톱 실시간 인수는 미검증. [OSS 조사](research/team-up-oss.md) |
+| team-up은 브랜치와 커밋 또는 diff, 검증 증거 전달. PR 전달은 사용자의 `ship-it` 명시 호출로 진행, 기본 브랜치 반영은 필수 `verify` 통과 후 진행. 병합이 선행 조건인 Task는 지정 기본 브랜치 반영을 확인한 뒤 시작 | 워커 완료와 기본 브랜치 반영을 별도 상태로 관리. [OSS 조사](research/team-up-oss.md) |
+| 첫 구현 범위는 로컬 단일 Git 저장소와 team-up이 시작한 워커. 원격 실행·페더레이션·봇, 그룹 주소, 별도 전달 영수증, 기존 터미널 주입, 여러 Run 동시 감시는 범위에서 제외 | 단일 머신의 작업·질문·복구 기록은 SQLite와 Dispatch별 메시지로 보존. [OSS 조사](research/team-up-oss.md) |
 
 ## 후보
 
