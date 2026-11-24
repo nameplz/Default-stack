@@ -77,7 +77,7 @@ Keep `AGENTS.md` as the source of truth, with:
 - One line: run `<verify command>` before calling a change done; CI runs the same command.
 - Deliver through a pull request with the `ship-it` skill. Never push to the default branch.
 - Where the verification skill lives (`.claude/skills/verify/`, linked from `.agents/skills/verify`).
-- Repeated corrections: when the user corrects you, check your saved feedback (memory in Claude Code; `~/.codex/corrections.md` in Codex, appending `date | repo | correction`). If the same correction is already there, say it is a repeat and suggest pstack `correct`. Run it only after the user agrees.
+- Repeated corrections: when the user corrects you, check your saved feedback (memory in Claude Code; `~/.codex/corrections.md` in Codex, `~/.gemini/corrections.md` in agy, appending `date | repo | correction`). If the same correction is already there, say it is a repeat and suggest pstack `correct`. Run it only after the user agrees.
 - The table `| Rule | Enforced by | Past mistake it catches |`, with commit hashes where there are any.
 
 `CLAUDE.md` imports it with one line, `@AGENTS.md`. If `CLAUDE.md` exists, keep its content and add the import. Don't copy the same text into both files.
