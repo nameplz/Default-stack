@@ -395,6 +395,59 @@ class TeamUpTest(unittest.TestCase):
         with sqlite3.connect(self.db) as db:
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 2)
 
+    def test_done_accepts_utf8_evidence_file(self):
+        run = self.run_create()
+        dispatch, turn = self.start(run, self.task(run, "Finish the task"))
+        evidence = {
+            "status": "success", "result": "검증 완료", "changed_code": False,
+            "verification": [
+                {"command": "python3 -m unittest", "exit_code": 0, "location": "test.log"}
+            ],
+        }
+        value = json.dumps(evidence, ensure_ascii=False)
+        path = self.db.parent / "completion evidence.json"
+        path.write_text(value, encoding="utf-8")
+
+        reported = self.invoke("done", dispatch, "--turn", turn, "--evidence-file", path)
+        self.assertEqual(reported["evidence"], evidence)
+        with sqlite3.connect(self.db) as db:
+            stored, = db.execute("SELECT evidence FROM dispatches WHERE id = ?", (dispatch,)).fetchone()
+        self.assertEqual(json.loads(stored), evidence)
+        inline = self.invoke("done", dispatch, "--turn", turn, "--evidence", value)
+        self.assertEqual(inline["evidence"], reported["evidence"])
+
+    def test_done_rejects_invalid_json_in_evidence_file(self):
+        run = self.run_create()
+        dispatch, turn = self.start(run, self.task(run, "Finish the task"))
+        value = '{\r\n  "status": }'
+        path = self.db.parent / "evidence.json"
+        path.write_bytes(value.encode("utf-8"))
+
+        inline = self.invoke("done", dispatch, "--turn", turn, "--evidence", value, expected=1)
+        self.assertTrue(inline.stderr.startswith("team-up: invalid evidence JSON:"))
+        self.invoke("done", dispatch, "--turn", turn, "--evidence-file", path,
+                    expected=1, stderr=inline.stderr)
+
+    def test_done_rejects_unreadable_evidence_file(self):
+        run = self.run_create()
+        dispatch, turn = self.start(run, self.task(run, "Finish the task"))
+        missing = self.db.parent / "missing.json"
+        invalid_utf8 = self.db.parent / "invalid-utf8.json"
+        invalid_utf8.write_bytes(b"\xff")
+
+        for path in (missing, self.db.parent, invalid_utf8):
+            with self.subTest(path=path):
+                result = self.invoke("done", dispatch, "--turn", turn, "--evidence-file", path, expected=1)
+                self.assertTrue(result.stderr.startswith(f"team-up: could not read evidence file {str(path)!r}:"))
+                self.assertNotIn("Traceback", result.stderr)
+
+    def test_done_requires_exactly_one_evidence_option(self):
+        result = self.invoke("done", 1, "--turn", 1, expected=2)
+        self.assertIn("one of the arguments --evidence --evidence-file is required", result.stderr)
+        result = self.invoke("done", 1, "--turn", 1, "--evidence", "{}",
+                             "--evidence-file", "evidence.json", expected=2)
+        self.assertIn("argument --evidence-file: not allowed with argument --evidence", result.stderr)
+
     def test_completion_follow_up_keeps_instructions_and_fences_reports(self):
         worktree = self.linked_worktree()
         run = self.run_create(slots=1)

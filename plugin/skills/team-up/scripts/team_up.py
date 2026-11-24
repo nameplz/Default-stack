@@ -804,7 +804,13 @@ def completion_evidence(value):
 
 def done(db, args):
     dispatch = current_turn(db, args)
-    evidence = completion_evidence(args.evidence)
+    value = args.evidence
+    if args.evidence_file is not None:
+        try:
+            value = args.evidence_file.read_bytes().decode("utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise StateError(f"could not read evidence file {str(args.evidence_file)!r}: {exc}") from exc
+    evidence = completion_evidence(value)
     if dispatch["review_main"] and evidence["changed_code"]:
         raise StateError("a main checkout review requires changed_code: false")
     if dispatch["evidence"] is not None:
@@ -1018,7 +1024,10 @@ def parser():
     ask_command.add_argument("--timeout", type=duration, required=True)
     command("answer", answer_question, "question_id").add_argument("answer", type=nonempty)
     command("instruct", instruct, "dispatch").add_argument("text", type=nonempty)
-    command("done", done, "dispatch", turn=True).add_argument("--evidence", required=True)
+    done_command = command("done", done, "dispatch", turn=True)
+    evidence_group = done_command.add_mutually_exclusive_group(required=True)
+    evidence_group.add_argument("--evidence", metavar="JSON")
+    evidence_group.add_argument("--evidence-file", type=Path, metavar="PATH")
 
     command("wait", wait, "run", writes=False).add_argument("--timeout", type=duration, default=30)
     command("ack", ack, "run").add_argument("event", type=nonnegative_int)
