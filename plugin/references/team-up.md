@@ -4,7 +4,7 @@ Use one coordinator for one active Run in one local Git repository. Start only w
 
 ## Identify the host and open the Run
 
-1. In the Claude desktop app's Code tab, use the host's side-session tools when they are available. Note whether the current turn came from the user or a background notification. In the Claude Code CLI, use shell jobs for external workers. In an interactive Codex CLI session, follow the [Codex coordinator procedure](#codex-coordinator).
+1. In the Claude desktop app's Code tab, use the host's side-session tools when they are available. Note whether the current turn came from the user or a background notification. In the Claude Code CLI, use shell jobs for external workers. In an interactive Codex CLI session, follow the [Codex coordinator procedure](#codex-coordinator). In an interactive agy session, follow the [agy coordinator procedure](#agy-coordinator).
 2. Use Python 3 with the SQLite WAL-reset fix for the coordinator and worker commands. For Claude workers, use the same executable in the Bash allow rule. `init` and `status` warn if the current Python uses an affected version. The fix is in SQLite 3.51.3 and later, with backports starting at 3.44.6 and 3.50.7 on their respective branches. [SQLite's WAL-reset notes](https://www.sqlite.org/wal.html#the_wal_reset_bug)
 3. Resolve `scripts/team_up.py` relative to the installed `SKILL.md`. Set `script` to its absolute path and `python` to the selected Python executable. Run `init` from the target repository before any worker connects. Keep the absolute DB path returned by `init`. Set `db` to that path and `state_dir` to its parent. Give each worker the same DB path. Worktree checks use the Git common directory saved at `init`, so with an absolute `--db` path they work from any directory.
 4. On pickup, reuse the saved DB path and open the existing Run with `status <run-id>`. Reconcile its worker handles, worktrees, unprocessed events, and pending questions before reserving anything. The DB path defaults to `~/.local/state/default-stack/team-up/<repo-id>.db`. The ID is the first 16 hex digits of the SHA-256 of the real path returned by `git rev-parse --path-format=absolute --git-common-dir`.
@@ -12,7 +12,7 @@ Use one coordinator for one active Run in one local Git repository. Start only w
 
 Use the local script's `--help` for command arguments. The examples put `--db` before the subcommand. Replace the shell variables and example values with the actual Run values. Replace the example `python3` with the selected executable if you use a different one.
 
-Schema v3 requires a new DB if `init` reports schema v2. Keep the old DB for its Run history and pass a new absolute `--db` path to `init`.
+Running `init` upgrades a schema v3 DB to v4 in place; other commands on v3 ask for `init` first. Schema v2 and older DBs still require a new absolute `--db` path to `init`; keep the old DB for its Run history.
 
 ### Codex coordinator
 
@@ -38,6 +38,28 @@ codex resume -C "$repo" -s workspace-write --add-dir "$state_dir" -a on-request 
 ```
 
 Pass the absolute DB path in the prompt. Use the saved thread ID every time and avoid `--last`. Treat shell-session handles as unavailable after a coordinator restart. Check `status` and verify each worker using its saved PID and process start identity. Read its saved output and exit-status files to reconcile reports and confirmed exits. Keep the slot reserved while liveness is unknown.
+
+### agy coordinator
+
+Start an interactive agy session in the main checkout of the target repository.
+
+```sh
+agy
+```
+
+Use the same DB commands as the Claude and Codex hosts. Open the Run with `init`, `run-create`, and `task-create`. Dispatch workers with `reserve`, `begin`, and `started`. Track work with `wait`, `ack`, `status`, `turn-ended`, and `exited`. Finish with `delivered` and `cleanup`.
+
+Codex, Claude, and agy workers are allowed from an agy coordinator, using their respective sections below. Side sessions and `Agent` with `isolation: worktree` are available only in the Claude desktop app's Code tab.
+
+Launch workers as background shell jobs. Save each worker's execution handle, PID and process start identity, and output and exit-status file paths. Poll with `wait <run-id> --timeout 30` and the saved handles. After each return, reconcile questions, `done` reports, and exits, then pass the returned cursor to `ack`. Record `exited` only after confirming the actual exit code. There is no host notification; worker completion does not start a new coordinator turn.
+
+Keep the coordinator turn active while workers run when possible. If you end the turn, save the coordinator's conversation ID and resume it explicitly.
+
+```sh
+agy --conversation "$coordinator_conversation_id"
+```
+
+Name the Run ID and absolute DB path when picking up. On restart, check `status`, verify each worker using its saved PID and process start identity, and read its saved output and exit-status files to reconcile reports and confirmed exits. Keep the slot reserved while liveness is unknown.
 
 ## Record a gate decision
 
@@ -92,6 +114,7 @@ Use the following commands as examples for the brief. Replace the evidence JSON 
 /opt/python/bin/python3 /opt/team-up/team_up.py --db /var/tmp/team-up/state.db heartbeat 12 --turn 1
 /opt/python/bin/python3 /opt/team-up/team_up.py --db /var/tmp/team-up/state.db record 12 --turn 1 'Which path should I use?'
 /opt/python/bin/python3 /opt/team-up/team_up.py --db /var/tmp/team-up/state.db done 12 --turn 1 --evidence '{"status":"success","result":"Full result with test output","verification":[{"command":"/usr/bin/python3 -m unittest","exit_code":0,"location":"completion report result"}],"changed_code":true,"diff":"<Git patch output encoded as a JSON string>"}'
+/opt/python/bin/python3 /opt/team-up/team_up.py --db /var/tmp/team-up/state.db done 12 --turn 1 --evidence-file /var/tmp/team-up/evidence-12-t1.json
 ```
 
 Use one terminal path per turn. A worker that records a blocking question ends the turn instead of running `done`. Preserve the worker log and Git patch before cleanup.
@@ -115,11 +138,46 @@ Record `turn.completed` or `turn.failed` with `turn-ended` when observed. After 
 
 If you missed the thread ID and the Dispatch is `turn-ended`, `waiting`, or closed with a completion report, read `thread.started` from the saved JSONL. Fill the missing ID for the current turn with `started <dispatch-id> --turn <turn> --session <thread-id>` before resuming.
 
+### agy worker
+
+Register Tasks with `--worker agy`. From a coordinator-owned background job with `cwd` set to the worktree, run the command below and save stdout and stderr per Dispatch and turn under the state directory. The brief cannot come from plain text stdin; pass it with `-p`. Both `state_dir` and `script_dir` must be inside `cwd` or an `--add-dir` because the sandbox blocks reads outside them. In a linked worktree, pass the Git common dir as an extra `--add-dir`; without it, `git` commands inside the sandbox fail with `fatal: not a git repository`.
+
+```sh
+(
+  cd "$worktree" || exit
+  agy --sandbox --add-dir "$state_dir" --add-dir "$script_dir" \
+    --settings "$settings" --output-format stream-json --print-timeout <limit> \
+    -p "$(cat "$brief_file")" < /dev/null
+)
+```
+
+Configure `$settings` with `permissions.allow` using the directory form `write_file(<worktree>)` and `command(*)` (for example, `{"permissions":{"allow":["write_file(<worktree>)","command(*)"]}}`). Glob forms (`write_file(<dir>/**)`) and specific command rules (`command(<word>)`) had no effect.
+
+Read `conversation_id` from the first (`init`) NDJSON line and save it with `started --session`. User hooks (such as `~/.gemini/config/hooks`) may spawn extra short-lived `agy` processes on each turn.
+
+For a follow-up, wait for the current process to exit and verify the recorded worktree and branch. Resume with `agy --conversation "$id"` and repeat every flag, because none persist across invocations.
+
+```sh
+(
+  cd "$worktree" || exit
+  agy --conversation "$id" --sandbox --add-dir "$state_dir" --add-dir "$script_dir" \
+    --settings "$settings" --output-format stream-json --print-timeout <limit> \
+    -p "$(cat "$brief_file")" < /dev/null
+)
+```
+
+Handle exit codes as follows:
+
+- `0`: completed. Permission denials also exit `0` with `status: "SUCCESS"`; check `result.denied_actions`, `ERROR` tool steps, on-disk effects, and DB writes before treating the turn as successful.
+- `1`: error. Exit `1` with an empty `conversation_id` is a transient start failure; retry after confirming no worker is running.
+- `2`: usage or flag error.
+- `3`: `--print-timeout` expired (`finished_reason: "print_timeout"`). Resume with the same conversation ID.
+
 ### Claude worker
 
 - On a user turn in the Claude desktop app's Code tab, prefer the host's `start_session` side session in the prepared worktree. Store its session ID. On a question, confirm that the current turn is idle before recording its exit and keep the session open for the answer. Send the follow-up to that exact session. When the Dispatch finishes, use the host's session state and stop controls to verify shutdown before releasing the slot. For a preserved session, confirm that team-up's execution has ended and leave the idle session open.
 - On a notification or session-message turn in the Claude desktop app's Code tab, use `Agent` with `isolation: worktree` or start a Codex worker for a compatible Task. Use the host-returned Agent ID and worktree. If the host discards a worktree or offers no way to resume the same Agent, report that blocker and confirm shutdown before considering a retry. On these turns a desktop side-session card needs a user action to start.
-- For a Claude CLI worker, set `python` and `script` to the exact unquoted paths in the brief. Build the `--allowedTools` list from the worker's DB command prefix, the Task's `Edit only` paths, and its `Verify` and `Diff` commands. Add one exact `Bash(<command>)` rule for each supplied command under `Verify` and `Diff`. Leave out edit and diff rules for read-only Tasks. If Claude's Bash sandbox is enabled, include the absolute state directory in `sandbox.filesystem.allowWrite` on launch and resume. Save the returned `session_id`.
+- For a Claude CLI worker, set `python` and `script` to the exact unquoted paths in the brief. Build the `--allowedTools` list from the worker's DB command prefix, the Task's `Edit only` paths, and its `Verify` and `Diff` commands. Add one exact `Bash(<command>)` rule for each supplied command under `Verify` and `Diff`. Claude print mode denies `--evidence "$(cat file)"`; give Claude workers `done <id> --turn <turn> --evidence-file <path>` and allow that exact command prefix. Leave out edit and diff rules for read-only Tasks. If Claude's Bash sandbox is enabled, include the absolute state directory in `sandbox.filesystem.allowWrite` on launch and resume. Save the returned `session_id`.
 
 In `claude -p`, `--allowedTools` accepts path-scoped `Edit` rules that cover both `Edit` and `Write`. Use paths relative to the worker's worktree, such as `Edit(./src/**)`. For an absolute path, use `Edit(//path/to/worktree/src/**)`. [Print-mode allow rules](https://code.claude.com/docs/en/headless#create-a-commit) [File permission patterns](https://code.claude.com/docs/en/permissions#read-and-edit)
 
@@ -235,7 +293,7 @@ Use `ask --timeout <seconds>` only when the worker must continue in the same tur
 
 If the current turn has no runtime handle, `turn-ended` and `exited` warn on stderr and still save the report. This lets you record a confirmed exit after a missed `started`. An `exited --start-failed` report has no runtime warning.
 
-If worker activity is still expected in the Claude desktop app's Code tab, start `wait <run-id> --timeout 30` as a background Bash job and end the turn. The job's completion wakes the coordinator. In an active CLI coordinator, poll with `wait <run-id> --timeout 30` and reconcile after each return. If the CLI coordinator exits, resume its saved session and name the absolute DB path and Run ID in the prompt. Use `claude -p --resume <coordinator-session-id>` for Claude Code CLI. For Codex CLI, follow the [Codex coordinator pickup procedure](#codex-coordinator).
+If worker activity is still expected in the Claude desktop app's Code tab, start `wait <run-id> --timeout 30` as a background Bash job and end the turn. The job's completion wakes the coordinator. In an active CLI coordinator, poll with `wait <run-id> --timeout 30` and reconcile after each return. If the CLI coordinator exits, resume its saved session and name the absolute DB path and Run ID in the prompt. Use `claude -p --resume <coordinator-session-id>` for Claude Code CLI. For Codex CLI, follow the [Codex coordinator pickup procedure](#codex-coordinator). For agy, follow the [agy coordinator pickup procedure](#agy-coordinator).
 
 ## Stop or retry
 
@@ -254,4 +312,4 @@ If worker activity is still expected in the Claude desktop app's Code tab, start
 
 ## Limits
 
-Run on a single machine in one local repository. Keep the coordinator's watch scoped to one Run. Coordination in the Codex Desktop app and Codex App Server is unverified and unsupported. Codex shell-session survival across coordinator exit, maximum Codex shell wait, CLI background `wait` auto-wake, and live desktop takeover of external Codex threads remain unverified. Independent worker limits and WAL lock wait with dozens of workers also remain unverified. For the Orca migration, the user controls when to disable `~/.agents/skills/orchestration`.
+Run on a single machine in one local repository. Keep the coordinator's watch scoped to one Run. Coordination in the Codex Desktop app and Codex App Server is unverified and unsupported. Codex shell-session survival across coordinator exit, maximum Codex shell wait, CLI background `wait` auto-wake, and live desktop takeover of external Codex threads remain unverified. agy auto-wake (background task wake, timers, `/swarm`, and `agy acp`) is unverified. In agy, Auto mode without `--sandbox` can bypass the command sandbox. Independent worker limits and WAL lock wait with dozens of workers also remain unverified. For the Orca migration, the user controls when to disable `~/.agents/skills/orchestration`.

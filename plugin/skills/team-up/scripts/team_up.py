@@ -15,8 +15,19 @@ import sys
 import time
 
 
-SCHEMA_VERSION = 3
-SCHEMA = """
+SCHEMA_VERSION = 4
+TASKS_SCHEMA = """CREATE TABLE {} (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    worker TEXT NOT NULL CHECK (worker IN ('claude', 'codex', 'agy')),
+    goal TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    evidence_requirement TEXT NOT NULL,
+    completed_at TEXT,
+    merged_base TEXT,
+    merged_commit TEXT
+)"""
+SCHEMA = f"""
 CREATE TABLE repository (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     common_dir TEXT NOT NULL
@@ -28,17 +39,7 @@ CREATE TABLE runs (
     base TEXT,
     cursor INTEGER NOT NULL DEFAULT 0
 );
-CREATE TABLE tasks (
-    id INTEGER PRIMARY KEY,
-    run_id INTEGER NOT NULL REFERENCES runs(id),
-    worker TEXT NOT NULL CHECK (worker IN ('claude', 'codex')),
-    goal TEXT NOT NULL,
-    scope TEXT NOT NULL,
-    evidence_requirement TEXT NOT NULL,
-    completed_at TEXT,
-    merged_base TEXT,
-    merged_commit TEXT
-);
+{TASKS_SCHEMA.format("tasks")};
 CREATE INDEX tasks_run ON tasks(run_id);
 CREATE TABLE dependencies (
     task_id INTEGER NOT NULL REFERENCES tasks(id),
@@ -160,6 +161,43 @@ def repository_common_dir(db):
     return row[0]
 
 
+def migrate_v3(db, repo_common_dir):
+    # https://www.sqlite.org/lang_altertable.html#making_other_kinds_of_table_schema_changes
+    db.execute("PRAGMA foreign_keys=OFF")
+    try:
+        with transaction(db):
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+            if version not in (3, SCHEMA_VERSION):
+                raise StateError(f"database schema version {version} does not match {SCHEMA_VERSION}; "
+                                 "keep the existing DB and run init with a new --db path")
+            if repository_common_dir(db) != str(repo_common_dir):
+                raise StateError("database belongs to a different repository")
+            if version == SCHEMA_VERSION:
+                return
+            schema_objects = db.execute(
+                "SELECT sql FROM sqlite_master WHERE tbl_name='tasks' "
+                "AND type IN ('index', 'trigger') AND sql IS NOT NULL"
+            ).fetchall()
+            db.execute(TASKS_SCHEMA.format("new_tasks"))
+            db.execute("""
+                INSERT INTO new_tasks
+                SELECT id, run_id, worker, goal, scope, evidence_requirement,
+                       completed_at, merged_base, merged_commit
+                FROM tasks
+            """)
+            db.execute("DROP TABLE tasks")
+            db.execute("ALTER TABLE new_tasks RENAME TO tasks")
+            for row in schema_objects:
+                db.execute(row["sql"])
+            violation = db.execute("PRAGMA foreign_key_check").fetchone()
+            if violation is not None:
+                raise StateError(f"cannot upgrade schema version 3: foreign key check failed "
+                                 f"for {violation['table']} row {violation['rowid']}")
+            db.execute("PRAGMA user_version=4")
+    finally:
+        db.execute("PRAGMA foreign_keys=ON")
+
+
 def connect(path, repo_common_dir=None):
     create = repo_common_dir is not None
     if create:
@@ -178,11 +216,17 @@ def connect(path, repo_common_dir=None):
             if version == 0 and create:
                 if db.execute("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").fetchone():
                     raise StateError("refusing to initialize an existing database with unknown objects")
-            elif version != SCHEMA_VERSION:
+            elif version == 3 and not create:
+                raise StateError(f"database schema version 3 at {path}; run init with --db pointing "
+                                 "to this file to upgrade")
+            elif version not in (3, SCHEMA_VERSION):
                 raise StateError(f"database schema version {version} does not match {SCHEMA_VERSION}; "
                                  "keep the existing DB and run init with a new --db path")
             elif create and repository_common_dir(db) != str(repo_common_dir):
                 raise StateError("database belongs to a different repository")
+        if version == 3:
+            migrate_v3(db, repo_common_dir)
+            return db
         if create:
             if db.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
                 if db.execute("PRAGMA journal_mode=WAL").fetchone()[0] != "wal":
@@ -760,7 +804,13 @@ def completion_evidence(value):
 
 def done(db, args):
     dispatch = current_turn(db, args)
-    evidence = completion_evidence(args.evidence)
+    value = args.evidence
+    if args.evidence_file is not None:
+        try:
+            value = args.evidence_file.read_bytes().decode("utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise StateError(f"could not read evidence file {str(args.evidence_file)!r}: {exc}") from exc
+    evidence = completion_evidence(value)
     if dispatch["review_main"] and evidence["changed_code"]:
         raise StateError("a main checkout review requires changed_code: false")
     if dispatch["evidence"] is not None:
@@ -928,7 +978,7 @@ def parser():
     run.add_argument("--base", type=nonempty)
 
     task = command("task-create", create_task, "run")
-    task.add_argument("--worker", choices=("claude", "codex"), required=True)
+    task.add_argument("--worker", choices=("claude", "codex", "agy"), required=True)
     for option in ("goal", "scope", "evidence"):
         task.add_argument(f"--{option}", type=nonempty, required=True)
     for option in ("after", "after-merge"):
@@ -974,7 +1024,10 @@ def parser():
     ask_command.add_argument("--timeout", type=duration, required=True)
     command("answer", answer_question, "question_id").add_argument("answer", type=nonempty)
     command("instruct", instruct, "dispatch").add_argument("text", type=nonempty)
-    command("done", done, "dispatch", turn=True).add_argument("--evidence", required=True)
+    done_command = command("done", done, "dispatch", turn=True)
+    evidence_group = done_command.add_mutually_exclusive_group(required=True)
+    evidence_group.add_argument("--evidence", metavar="JSON")
+    evidence_group.add_argument("--evidence-file", type=Path, metavar="PATH")
 
     command("wait", wait, "run", writes=False).add_argument("--timeout", type=duration, default=30)
     command("ack", ack, "run").add_argument("event", type=nonnegative_int)

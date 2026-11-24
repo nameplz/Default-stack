@@ -15,6 +15,104 @@ SCRIPT = Path(__file__).resolve().parents[1] / "team_up.py"
 REPO = SCRIPT.parents[4]
 
 
+V3_SCHEMA = """
+CREATE TABLE repository (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    common_dir TEXT NOT NULL
+);
+CREATE TABLE runs (
+    id INTEGER PRIMARY KEY,
+    goal TEXT NOT NULL,
+    slots INTEGER NOT NULL CHECK (slots > 0),
+    base TEXT,
+    cursor INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE tasks (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    worker TEXT NOT NULL CHECK (worker IN ('claude', 'codex')),
+    goal TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    evidence_requirement TEXT NOT NULL,
+    completed_at TEXT,
+    merged_base TEXT,
+    merged_commit TEXT
+);
+CREATE INDEX tasks_run ON tasks(run_id);
+CREATE TABLE dependencies (
+    task_id INTEGER NOT NULL REFERENCES tasks(id),
+    prerequisite_id INTEGER NOT NULL REFERENCES tasks(id),
+    condition TEXT NOT NULL CHECK (condition IN ('finish', 'merge')),
+    PRIMARY KEY (task_id, prerequisite_id),
+    CHECK (prerequisite_id < task_id)
+);
+CREATE TABLE gates (
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    name TEXT NOT NULL,
+    decision TEXT CHECK (decision IN ('approve', 'reject')),
+    note TEXT,
+    PRIMARY KEY (run_id, name)
+);
+CREATE TABLE task_gates (
+    run_id INTEGER NOT NULL,
+    task_id INTEGER NOT NULL REFERENCES tasks(id),
+    name TEXT NOT NULL,
+    PRIMARY KEY (task_id, name),
+    FOREIGN KEY (run_id, name) REFERENCES gates(run_id, name)
+);
+CREATE TABLE dispatches (
+    id INTEGER PRIMARY KEY,
+    task_id INTEGER NOT NULL REFERENCES tasks(id),
+    attempt INTEGER NOT NULL,
+    retry_of INTEGER REFERENCES dispatches(id),
+    phase TEXT NOT NULL CHECK (phase IN ('reserved', 'running', 'turn-ended', 'waiting', 'closed')),
+    turn INTEGER NOT NULL DEFAULT 0,
+    runtime TEXT,
+    session TEXT,
+    worktree TEXT,
+    branch TEXT,
+    review_main INTEGER NOT NULL DEFAULT 0,
+    unresumable INTEGER NOT NULL DEFAULT 0,
+    reserved_at TEXT NOT NULL,
+    heartbeat_at TEXT,
+    turn_ended_at TEXT,
+    exited_at TEXT,
+    exit_code INTEGER,
+    outcome TEXT,
+    stop_requested INTEGER NOT NULL DEFAULT 0,
+    abandon_reason TEXT,
+    evidence TEXT,
+    keep_open INTEGER NOT NULL DEFAULT 0,
+    taken_over INTEGER NOT NULL DEFAULT 0,
+    delivered INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (task_id, attempt)
+);
+CREATE UNIQUE INDEX one_open_task ON dispatches(task_id) WHERE phase != 'closed';
+CREATE UNIQUE INDEX one_open_worktree ON dispatches(worktree) WHERE phase != 'closed';
+CREATE INDEX worktree_history ON dispatches(worktree);
+CREATE TABLE messages (
+    id INTEGER PRIMARY KEY,
+    dispatch_id INTEGER NOT NULL REFERENCES dispatches(id),
+    turn INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('question', 'instruction')),
+    text TEXT NOT NULL,
+    answer TEXT,
+    consumed INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX messages_dispatch ON messages(dispatch_id, turn);
+CREATE TABLE events (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    task_id INTEGER REFERENCES tasks(id),
+    dispatch_id INTEGER REFERENCES dispatches(id),
+    kind TEXT NOT NULL,
+    at TEXT NOT NULL,
+    data TEXT NOT NULL
+);
+CREATE INDEX events_run ON events(run_id, id);
+"""
+
+
 class TeamUpTest(unittest.TestCase):
     def setUp(self):
         temp = TemporaryDirectory()
@@ -38,6 +136,30 @@ class TeamUpTest(unittest.TestCase):
     def run_create(self, slots=4, *options):
         self.invoke("init")
         return self.invoke("run-create", "--goal", "Run goal", "--slots", slots, *options)["id"]
+
+    def create_v3(self):
+        repo_common_dir = subprocess.check_output(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=self.cwd, text=True,
+        ).strip()
+        with sqlite3.connect(self.db) as db:
+            db.executescript(V3_SCHEMA)
+            db.executescript("""
+                PRAGMA user_version=3;
+                PRAGMA foreign_keys=ON;
+                INSERT INTO runs VALUES (7, 'Run goal', 2, 'main', 3);
+                INSERT INTO tasks VALUES
+                    (11, 7, 'claude', 'Review', 'src/', 'Show tests', 'finished', 'main', 'abc123'),
+                    (19, 7, 'codex', 'Implement', 'tests/', 'Show patch', NULL, NULL, NULL);
+                INSERT INTO dependencies VALUES (19, 11, 'merge');
+                INSERT INTO gates VALUES (7, 'review', 'approve', 'Approved');
+                INSERT INTO task_gates VALUES (7, 19, 'review');
+                INSERT INTO dispatches (id, task_id, attempt, phase, turn, reserved_at)
+                    VALUES (29, 19, 1, 'waiting', 2, 'reserved');
+                INSERT INTO messages VALUES (31, 29, 2, 'question', 'Proceed?', 'Yes', 1);
+                INSERT INTO events VALUES (37, 7, 19, 29, 'question', 'recorded', '{}');
+            """)
+            db.execute("INSERT INTO repository VALUES (1, ?)", (str(Path(repo_common_dir).resolve()),))
 
     def task(self, run, goal, *constraints):
         return self.invoke(
@@ -95,7 +217,7 @@ class TeamUpTest(unittest.TestCase):
     def test_only_init_creates_or_changes_journal(self):
         self.invoke("run-create", "--goal", "Run", "--slots", 1, expected=1)
         self.assertFalse(self.db.exists())
-        self.invoke("init")
+        self.assertEqual(self.invoke("init")["schema_version"], 4)
         with sqlite3.connect(self.db) as db:
             self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
             self.assertEqual(db.execute("PRAGMA journal_mode=DELETE").fetchone()[0], "delete")
@@ -219,6 +341,50 @@ class TeamUpTest(unittest.TestCase):
         self.assertEqual(self.invoke("reserve", run, "--task", task)["task_id"], task)
         self.invoke("gate", run, "rollout", "--decision", "reject", expected=1)
 
+    def test_init_upgrades_v3_and_preserves_data_and_foreign_keys(self):
+        self.create_v3()
+        with sqlite3.connect(self.db) as db:
+            original_rows = [line for line in db.iterdump() if line.startswith("INSERT INTO ")]
+
+        self.assertEqual(self.invoke("init")["schema_version"], 4)
+        with sqlite3.connect(self.db) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+            self.assertIn("tasks_run", [row[1] for row in db.execute("PRAGMA index_list(tasks)")])
+            self.assertEqual([line for line in db.iterdump() if line.startswith("INSERT INTO ")], original_rows)
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute("UPDATE tasks SET worker = 'unknown' WHERE id = 19")
+
+        task_id = self.invoke(
+            "task-create", 7, "--worker", "agy", "--goal", "Verify",
+            "--scope", "src/", "--evidence", "Show the verification result",
+        )["id"]
+        self.assertEqual(self.invoke("init")["schema_version"], 4)
+        with sqlite3.connect(self.db) as db:
+            self.assertEqual(db.execute("SELECT worker FROM tasks WHERE id = ?", (task_id,)).fetchone(), ("agy",))
+
+    def test_non_init_on_v3_suggests_init_on_the_same_database(self):
+        self.create_v3()
+        result = self.invoke("status", 7, expected=1)
+        self.assertIn("schema version 3", result.stderr)
+        self.assertIn("run init", result.stderr)
+        self.assertIn(str(self.db), result.stderr)
+        with sqlite3.connect(self.db) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
+
+    def test_init_rolls_back_v3_upgrade_when_foreign_key_check_fails(self):
+        self.create_v3()
+        with sqlite3.connect(self.db) as db:
+            db.execute("PRAGMA foreign_keys=OFF")
+            db.execute("UPDATE dispatches SET task_id = 99 WHERE id = 29")
+        original = self.db.read_bytes()
+
+        result = self.invoke("init", expected=1)
+        self.assertIn("foreign key check failed", result.stderr)
+        with sqlite3.connect(self.db) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
+        self.assertEqual(self.db.read_bytes(), original)
+
     def test_init_refuses_v2_and_preserves_the_existing_database(self):
         self.invoke("init")
         with sqlite3.connect(self.db) as db:
@@ -228,6 +394,59 @@ class TeamUpTest(unittest.TestCase):
         self.assertIn("new --db path", result.stderr)
         with sqlite3.connect(self.db) as db:
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 2)
+
+    def test_done_accepts_utf8_evidence_file(self):
+        run = self.run_create()
+        dispatch, turn = self.start(run, self.task(run, "Finish the task"))
+        evidence = {
+            "status": "success", "result": "검증 완료", "changed_code": False,
+            "verification": [
+                {"command": "python3 -m unittest", "exit_code": 0, "location": "test.log"}
+            ],
+        }
+        value = json.dumps(evidence, ensure_ascii=False)
+        path = self.db.parent / "completion evidence.json"
+        path.write_text(value, encoding="utf-8")
+
+        reported = self.invoke("done", dispatch, "--turn", turn, "--evidence-file", path)
+        self.assertEqual(reported["evidence"], evidence)
+        with sqlite3.connect(self.db) as db:
+            stored, = db.execute("SELECT evidence FROM dispatches WHERE id = ?", (dispatch,)).fetchone()
+        self.assertEqual(json.loads(stored), evidence)
+        inline = self.invoke("done", dispatch, "--turn", turn, "--evidence", value)
+        self.assertEqual(inline["evidence"], reported["evidence"])
+
+    def test_done_rejects_invalid_json_in_evidence_file(self):
+        run = self.run_create()
+        dispatch, turn = self.start(run, self.task(run, "Finish the task"))
+        value = '{\r\n  "status": }'
+        path = self.db.parent / "evidence.json"
+        path.write_bytes(value.encode("utf-8"))
+
+        inline = self.invoke("done", dispatch, "--turn", turn, "--evidence", value, expected=1)
+        self.assertTrue(inline.stderr.startswith("team-up: invalid evidence JSON:"))
+        self.invoke("done", dispatch, "--turn", turn, "--evidence-file", path,
+                    expected=1, stderr=inline.stderr)
+
+    def test_done_rejects_unreadable_evidence_file(self):
+        run = self.run_create()
+        dispatch, turn = self.start(run, self.task(run, "Finish the task"))
+        missing = self.db.parent / "missing.json"
+        invalid_utf8 = self.db.parent / "invalid-utf8.json"
+        invalid_utf8.write_bytes(b"\xff")
+
+        for path in (missing, self.db.parent, invalid_utf8):
+            with self.subTest(path=path):
+                result = self.invoke("done", dispatch, "--turn", turn, "--evidence-file", path, expected=1)
+                self.assertTrue(result.stderr.startswith(f"team-up: could not read evidence file {str(path)!r}:"))
+                self.assertNotIn("Traceback", result.stderr)
+
+    def test_done_requires_exactly_one_evidence_option(self):
+        result = self.invoke("done", 1, "--turn", 1, expected=2)
+        self.assertIn("one of the arguments --evidence --evidence-file is required", result.stderr)
+        result = self.invoke("done", 1, "--turn", 1, "--evidence", "{}",
+                             "--evidence-file", "evidence.json", expected=2)
+        self.assertIn("argument --evidence-file: not allowed with argument --evidence", result.stderr)
 
     def test_completion_follow_up_keeps_instructions_and_fences_reports(self):
         worktree = self.linked_worktree()
