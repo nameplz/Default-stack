@@ -1,11 +1,11 @@
 # Coordinate a run with team-up
 
-Use one Claude coordinator for one active Run in one local Git repository. Start only workers owned by the Run. Keep their execution handles and SQLite records so you can recover after a coordinator restart.
+Use one coordinator for one active Run in one local Git repository. Start only workers owned by the Run. Keep their execution handles and SQLite records so you can recover after a coordinator restart.
 
 ## Identify the host and open the Run
 
-1. In the Claude desktop app's Code tab, use the host's side-session tools when they are available. Note whether the current turn came from the user or a background notification. In the Claude Code CLI, use shell jobs for external workers. If the host is Codex, direct the user to Claude Code.
-2. Use Python 3 with the SQLite WAL-reset fix for the coordinator, worker commands, and Claude Bash allow rule. `init` and `status` warn if the current Python uses an affected version. The fix is in SQLite 3.51.3 and later, with backports starting at 3.44.6 and 3.50.7 on their respective branches. [SQLite's WAL-reset notes](https://www.sqlite.org/wal.html#the_wal_reset_bug)
+1. In the Claude desktop app's Code tab, use the host's side-session tools when they are available. Note whether the current turn came from the user or a background notification. In the Claude Code CLI, use shell jobs for external workers. In an interactive Codex CLI session, follow the [Codex coordinator procedure](#codex-coordinator).
+2. Use Python 3 with the SQLite WAL-reset fix for the coordinator and worker commands. For Claude workers, use the same executable in the Bash allow rule. `init` and `status` warn if the current Python uses an affected version. The fix is in SQLite 3.51.3 and later, with backports starting at 3.44.6 and 3.50.7 on their respective branches. [SQLite's WAL-reset notes](https://www.sqlite.org/wal.html#the_wal_reset_bug)
 3. Resolve `scripts/team_up.py` relative to the installed `SKILL.md`. Set `script` to its absolute path and `python` to the selected Python executable. Run `init` from the target repository before any worker connects. Keep the absolute DB path returned by `init`. Set `db` to that path and `state_dir` to its parent. Give each worker the same DB path. Worktree checks use the Git common directory saved at `init`, so with an absolute `--db` path they work from any directory.
 4. On pickup, reuse the saved DB path and open the existing Run with `status <run-id>`. Reconcile its worker handles, worktrees, unprocessed events, and pending questions before reserving anything. The DB path defaults to `~/.local/state/default-stack/team-up/<repo-id>.db`. The ID is the first 16 hex digits of the SHA-256 of the real path returned by `git rev-parse --path-format=absolute --git-common-dir`.
 5. For a new Run, use `run-create --goal <goal> --slots <count>`. Keep its ID for pickup. Set `--base <ref>` when a dependency requires a merge into a designated branch. Use `task-create` to record each Task's worker type, goal, editable paths, and required completion evidence. Create prerequisites first. Use `--after` for a completion dependency and `--after-merge` for a merge dependency. Add any user decision gate with `--gate <name>`. Record the user's decision with `gate` before dispatching dependent work.
@@ -13,6 +13,31 @@ Use one Claude coordinator for one active Run in one local Git repository. Start
 Use the local script's `--help` for command arguments. The examples put `--db` before the subcommand. Replace the shell variables and example values with the actual Run values. Replace the example `python3` with the selected executable if you use a different one.
 
 Schema v3 requires a new DB if `init` reports schema v2. Keep the old DB for its Run history and pass a new absolute `--db` path to `init`.
+
+### Codex coordinator
+
+Start an interactive Codex CLI session in the target repository. Use the absolute directory that will hold the Run DB as `state_dir`.
+
+```sh
+codex -C "$repo" -s workspace-write --add-dir "$state_dir" -a on-request
+```
+
+Use the same DB commands as the Claude hosts. Open the Run with `init`, `run-create`, and `task-create`. Dispatch workers with `reserve`, `begin`, and `started`. Track work with `wait`, `ack`, `status`, `turn-ended`, and `exited`. Finish with `delivered` and `cleanup`.
+
+The coordinator's `workspace-write` sandbox protects the Git directory and blocks network access. Use the `on-request` approval prompt to run Git metadata writes outside the sandbox, including `git worktree add`, `git worktree remove`, staging, and commits. Request the same escalation for `codex exec` and `claude -p` launches and resumes. A worker launched inside the coordinator's sandbox inherits its restrictions and can fail on authentication, network access, or session writes.
+
+Use the [Codex worker commands](#codex-worker) with `-s workspace-write --add-dir "$state_dir"`. For Claude workers, use the [Claude CLI commands](#claude-worker) with `--output-format json` and the Task's `--allowedTools` rules. Resume Claude with its saved session ID and check `permission_denials` after each turn. Side sessions and `Agent` with `isolation: worktree` are available only in the Claude desktop app's Code tab.
+
+Start each worker with a short yield in the unified shell tool `exec_command` and save its session handle. Save the worker PID and its process start identity, plus the paths to its output and exit-status files. Poll each handle with an empty `write_stdin` call. Alternate polling with `wait <run-id> --timeout 30` during the active turn. After each return, reconcile questions, `done` reports, and exits, then pass the returned cursor to `ack`. While you have the handle, record `exited` only after it reports the actual exit code. Worker completion does not start a new Codex coordinator turn.
+
+Keep the coordinator turn active until running workers exit when possible. If you must end the turn, save the coordinator's thread ID. Resume that exact thread with the same repository, sandbox, state directory, and approval flags.
+
+```sh
+codex resume -C "$repo" -s workspace-write --add-dir "$state_dir" -a on-request \
+  "$coordinator_thread_id" "Pick up Run $run_id using DB $db"
+```
+
+Pass the absolute DB path in the prompt. Use the saved thread ID every time and avoid `--last`. Treat shell-session handles as unavailable after a coordinator restart. Check `status` and verify each worker using its saved PID and process start identity. Read its saved output and exit-status files to reconcile reports and confirmed exits. Keep the slot reserved while liveness is unknown.
 
 ## Record a gate decision
 
@@ -40,13 +65,13 @@ Turn: <turn number>
 Worktree and branch: <absolute worktree path and branch>
 Goal: <deliverable>
 Edit only: <paths>
-Verify: <exact commands, one per Bash call, and expected evidence>
+Verify: <exact commands, one per shell call, and expected evidence>
 Diff: <exact read-only Git commands for the editable paths>
 State DB: <absolute DB path>
 Python: <selected executable>
 Script: <absolute script path used in the commands>
 
-Run each supplied command in its own Bash call from the assigned worktree.
+Run each supplied command in its own shell call from the assigned worktree.
 Keep the command prefix exactly as supplied. If a required tool call is denied,
 record a question naming the denied tool and path or command. Record any blocking
 question once and end the turn.
@@ -92,9 +117,9 @@ If you missed the thread ID and the Dispatch is `turn-ended`, `waiting`, or clos
 
 ### Claude worker
 
-- On a desktop user turn, prefer the host's `start_session` side session in the prepared worktree. Store its session ID. On a question, confirm that the current turn is idle before recording its exit and keep the session open for the answer. Send the follow-up to that exact session. When the Dispatch finishes, use the host's session state and stop controls to verify shutdown before releasing the slot. For a preserved session, confirm that team-up's execution has ended and leave the idle session open.
-- On a desktop notification or session-message turn, use `Agent` with `isolation: worktree` or start a Codex worker for a compatible Task. Use the host-returned Agent ID and worktree. If the host discards a worktree or offers no way to resume the same Agent, report that blocker and confirm shutdown before considering a retry. On these turns a desktop side-session card needs a user action to start.
-- From the CLI, set `python` and `script` to the exact unquoted paths in the brief. Build the `--allowedTools` list from the worker's DB command prefix, the Task's `Edit only` paths, and its `Verify` and `Diff` commands. Add one exact `Bash(<command>)` rule for each supplied command under `Verify` and `Diff`. Leave out edit and diff rules for read-only Tasks. If Claude's Bash sandbox is enabled, include the absolute state directory in `sandbox.filesystem.allowWrite` on launch and resume. Save the returned `session_id`.
+- On a user turn in the Claude desktop app's Code tab, prefer the host's `start_session` side session in the prepared worktree. Store its session ID. On a question, confirm that the current turn is idle before recording its exit and keep the session open for the answer. Send the follow-up to that exact session. When the Dispatch finishes, use the host's session state and stop controls to verify shutdown before releasing the slot. For a preserved session, confirm that team-up's execution has ended and leave the idle session open.
+- On a notification or session-message turn in the Claude desktop app's Code tab, use `Agent` with `isolation: worktree` or start a Codex worker for a compatible Task. Use the host-returned Agent ID and worktree. If the host discards a worktree or offers no way to resume the same Agent, report that blocker and confirm shutdown before considering a retry. On these turns a desktop side-session card needs a user action to start.
+- For a Claude CLI worker, set `python` and `script` to the exact unquoted paths in the brief. Build the `--allowedTools` list from the worker's DB command prefix, the Task's `Edit only` paths, and its `Verify` and `Diff` commands. Add one exact `Bash(<command>)` rule for each supplied command under `Verify` and `Diff`. Leave out edit and diff rules for read-only Tasks. If Claude's Bash sandbox is enabled, include the absolute state directory in `sandbox.filesystem.allowWrite` on launch and resume. Save the returned `session_id`.
 
 In `claude -p`, `--allowedTools` accepts path-scoped `Edit` rules that cover both `Edit` and `Write`. Use paths relative to the worker's worktree, such as `Edit(./src/**)`. For an absolute path, use `Edit(//path/to/worktree/src/**)`. [Print-mode allow rules](https://code.claude.com/docs/en/headless#create-a-commit) [File permission patterns](https://code.claude.com/docs/en/permissions#read-and-edit)
 
@@ -144,7 +169,7 @@ After each turn, the coordinator must check JSON `permission_denials` and the co
 
 Reserve a read-only Task with `reserve <run-id> --task <task-id> --review-main --worktree "$review_checkout" --branch "$review_branch"`. Use the primary checkout's absolute physical path and current branch. Set `state_dir` to a dedicated directory outside any Git checkout, with no overlap with the review checkout or its Git directory. Use an absolute DB path in that directory and save the brief and worker logs there.
 
-Use CLI workers for this placement, including from a desktop coordinator. Give the worker `git -C "$review_checkout" --no-optional-locks status --short --untracked-files=all` and `git -C "$review_checkout" --no-pager diff --no-ext-diff --no-textconv --binary HEAD` with concrete paths in the brief. Tell the worker to read the live files and report findings with `changed_code: false`. Use `record` for a blocking question and the same session ID for the next turn.
+Use CLI workers for this placement on every coordinator host. From a Codex coordinator, request escalation for the launch and resume commands below with their review permissions intact. Give the worker `git -C "$review_checkout" --no-optional-locks status --short --untracked-files=all` and `git -C "$review_checkout" --no-pager diff --no-ext-diff --no-textconv --binary HEAD` with concrete paths in the brief. Tell the worker to read the live files and report findings with `changed_code: false`. Use `record` for a blocking question and the same session ID for the next turn.
 
 For Codex CLI 0.170.0, set a permission profile on both launches. It grants read access and gives SQLite write access to the state directory, including its WAL and shared-memory files. The built-in `read-only` mode blocks the DB write. Start Codex from the state directory so it does not load the review checkout's project configuration. [Codex permission profiles](https://github.com/openai/codex/blob/rust-v0.170.0/codex-rs/core/src/config/permissions.rs)
 
@@ -206,11 +231,11 @@ An unanswered question from a turn that reported `done` is stale and `answer` re
 
 Use `ask --timeout <seconds>` only when the worker must continue in the same turn. Poll the existing shell job. If the command exits with code 124, end the turn and leave the question in the DB for the next turn. If a host already provides an App Server Plan-mode connection, its blocking `item/tool/requestUserInput` is another same-turn path. Keep the question and answer in the Dispatch record. Use the shell or next-turn workflow for regular `codex exec`.
 
-`wait` returns on a worker `question` or `done` event, or on timeout. Use the worker job's host completion notification to learn of exit and record `exited`. `turn-ended` and `exited` stay in the DB as coordinator reports and advance the cursor without triggering a wake. Read current state on each return. Process pending questions and reports, reconcile exits, then reserve ready Tasks. Pass the returned cursor to `ack` after processing, even if the event list is empty. A restart can replay unacknowledged actionable events.
+`wait` returns on a worker `question` or `done` event, or on timeout. Confirm exit through the worker's host notification or by polling its shell session. `turn-ended` and `exited` stay in the DB as coordinator reports and advance the cursor without triggering a wake. Read current state on each return. Process pending questions and reports, reconcile exits, then reserve ready Tasks. Pass the returned cursor to `ack` after processing, even if the event list is empty. A restart can replay unacknowledged actionable events.
 
 If the current turn has no runtime handle, `turn-ended` and `exited` warn on stderr and still save the report. This lets you record a confirmed exit after a missed `started`. An `exited --start-failed` report has no runtime warning.
 
-If worker activity is still expected, start `wait <run-id> --timeout 30` as a background Bash job on desktop and end the turn. The job's completion wakes the coordinator. In an active CLI coordinator, call `wait` to poll events and reconcile at the deadline. If the CLI coordinator has exited, explicitly resume it with `claude -p --resume <coordinator-session-id>` and identify the Run in the prompt.
+If worker activity is still expected in the Claude desktop app's Code tab, start `wait <run-id> --timeout 30` as a background Bash job and end the turn. The job's completion wakes the coordinator. In an active CLI coordinator, poll with `wait <run-id> --timeout 30` and reconcile after each return. If the CLI coordinator exits, resume its saved session and name the absolute DB path and Run ID in the prompt. Use `claude -p --resume <coordinator-session-id>` for Claude Code CLI. For Codex CLI, follow the [Codex coordinator pickup procedure](#codex-coordinator).
 
 ## Stop or retry
 
@@ -229,4 +254,4 @@ If worker activity is still expected, start `wait <run-id> --timeout 30` as a ba
 
 ## Limits
 
-Run on a single machine in one local repository. Keep the coordinator's watch scoped to one Run. Codex is a worker host. CLI background `wait` auto-wake, the maximum Codex shell-tool wait, and live desktop takeover of external Codex threads remain unverified. Independent worker limits and WAL lock wait with dozens of workers also remain unverified. For the Orca migration, the user controls when to disable `~/.agents/skills/orchestration`.
+Run on a single machine in one local repository. Keep the coordinator's watch scoped to one Run. Coordination in the Codex Desktop app and Codex App Server is unverified and unsupported. Codex shell-session survival across coordinator exit, maximum Codex shell wait, CLI background `wait` auto-wake, and live desktop takeover of external Codex threads remain unverified. Independent worker limits and WAL lock wait with dozens of workers also remain unverified. For the Orca migration, the user controls when to disable `~/.agents/skills/orchestration`.
