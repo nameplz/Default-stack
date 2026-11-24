@@ -14,7 +14,7 @@ apply-stack → ship-it ← team-up, formal, explore
 | `ship-it` | Deliver a change as a pull request that merges itself once `verify` passes |
 | `formal` | Formally verify the riskiest property, keep the proof in line with the code, gate merges on it |
 | `explore` | Drive a release through the feature map and ship a fix PR for each reproduced bug |
-| `team-up` | Coordinate Claude and Codex workers in separate Git worktrees from Claude Code or Codex CLI, with Run state in SQLite |
+| `team-up` | Coordinate Claude, Codex, and agy workers in separate Git worktrees from Claude Code, Codex CLI, or agy, with Run state in SQLite |
 
 Every skill runs only when you invoke it. Docs go to existing project docs when they fit, otherwise to `docs/default-stack/`.
 
@@ -46,11 +46,11 @@ Antigravity (agy), from a checkout of this repository:
 agy plugin install ./plugin
 ```
 
-Invoke with `/default-stack:coffee-chat`. `team-up` needs Claude Code or Codex CLI and does not run in agy.
+Invoke with `/default-stack:coffee-chat`.
 
 ## Team-up
 
-Run `/default-stack:team-up` in the Claude desktop app's Code tab or the Claude Code CLI, or invoke `$default-stack:team-up` in an interactive Codex CLI session. Install Python 3 and the CLI for each external worker type you use. See the [coordinator guide](plugin/references/team-up.md).
+Run `/default-stack:team-up` in the Claude desktop app's Code tab, the Claude Code CLI, or an interactive agy session, or invoke `$default-stack:team-up` in an interactive Codex CLI session. Install Python 3 and the CLI for each external worker type you use (Claude, Codex, or agy). See the [coordinator guide](plugin/references/team-up.md).
 
 Run the state CLI tests from the repository root with a Python build that includes SQLite's WAL-reset fix.
 
