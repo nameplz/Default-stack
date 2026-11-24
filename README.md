@@ -1,6 +1,6 @@
 # Default-stack
 
-Skills for Claude Code and Codex: shape a vague idea in casual chat, then set repositories up so checks, not instructions, hold agents to the work and changes merge themselves once `verify` passes.
+Skills for Claude Code, Codex, and Antigravity (agy): shape a vague idea in casual chat, then set repositories up so checks, not instructions, hold agents to the work and changes merge themselves once `verify` passes.
 
 ```
 coffee-chat
@@ -20,7 +20,7 @@ Every skill runs only when you invoke it. Docs go to existing project docs when 
 
 ## Install
 
-`apply-stack`, `ship-it`, `formal`, and `explore` read skills from pstack. Install it first: in Claude Code from [cursor/plugins](https://github.com/cursor/plugins/tree/main/pstack) (`/plugin marketplace add cursor/plugins`, then `/plugin install pstack@cursor-plugins`), in Codex from the port [michael-denyer/pstack-claude](https://github.com/michael-denyer/pstack-claude).
+`apply-stack`, `ship-it`, `formal`, and `explore` read skills from pstack. Install it first: in Claude Code from [cursor/plugins](https://github.com/cursor/plugins/tree/main/pstack) (`/plugin marketplace add cursor/plugins`, then `/plugin install pstack@cursor-plugins`), in Codex and agy from the port [michael-denyer/pstack-claude](https://github.com/michael-denyer/pstack-claude).
 
 Claude Code:
 
@@ -39,6 +39,14 @@ codex plugin add default-stack@default-stack
 ```
 
 Invoke by mentioning the skill with `$` (registered as `default-stack:coffee-chat`; list with `/skills`).
+
+Antigravity (agy), from a checkout of this repository:
+
+```
+agy plugin install ./plugin
+```
+
+Invoke with `/default-stack:coffee-chat`. `team-up` needs Claude Code and does not run in agy.
 
 ## Team-up
 
