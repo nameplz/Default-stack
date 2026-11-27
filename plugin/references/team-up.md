@@ -2,6 +2,8 @@
 
 Use one coordinator for one active Run in one local Git repository. Start only workers owned by the Run. Keep their execution handles and SQLite records so you can recover after a coordinator restart.
 
+Use `claude` or `codex` for new Tasks. agy remains available as an interactive coordinator that the user starts directly.
+
 ## Identify the host and open the Run
 
 1. In the Claude desktop app's Code tab, use the host's side-session tools when they are available. Note whether the current turn came from the user or a background notification. In the Claude Code CLI, use shell jobs for external workers. In an interactive Codex CLI session, follow the [Codex coordinator procedure](#codex-coordinator). In an interactive agy session, follow the [agy coordinator procedure](#agy-coordinator).
@@ -13,6 +15,21 @@ Use one coordinator for one active Run in one local Git repository. Start only w
 Use the local script's `--help` for command arguments. The examples put `--db` before the subcommand. Replace the shell variables and example values with the actual Run values. Replace the example `python3` with the selected executable if you use a different one.
 
 Running `init` upgrades a schema v3 DB to v4 in place; other commands on v3 ask for `init` first. Schema v2 and older DBs still require a new absolute `--db` path to `init`; keep the old DB for its Run history.
+
+### Existing agy records
+
+agy worker dispatch is no longer supported. Google's [Antigravity Terms of Service §6](https://antigravity.google/terms) and [FAQ](https://antigravity.google/docs/faq) prohibit third-party agent orchestration with consumer sign-in. team-up does not inspect authentication, so it blocks agy workers for all authentication types.
+
+Keep schema v4 and all saved agy Tasks, Dispatches, events, and evidence. team-up blocks new agy Tasks, reservations, retries, turns, answers, and instructions. Automatic reservation skips saved agy Tasks. If the Dispatch is `running` or `turn-ended` and has no recorded runtime, team-up also rejects `register` and `started`. Use `status <run-id>` to inspect Tasks, Dispatches with completion evidence, dependencies, and messages. Use `wait <run-id> --timeout 0` to read unacknowledged `question` and `done` events.
+
+Use `stop <dispatch-id>` to close a reservation that never began. For a begun Dispatch, record `stop` and ask the host to terminate that exact worker if it is still live. Keep the slot and worktree while liveness is unknown, even if the Dispatch has no runtime handle. After confirming shutdown, record `exited <dispatch-id> --turn <turn> --code <exit-code> --stopped`. If the worker exited on its own and no stop was requested, reconcile the actual exit with `exited`. Preserve saved results and follow the usual [delivery and cleanup checks](#deliver-and-clean-up).
+
+After confirming that the old worker has shut down or never started, recover unfinished work in the same Run.
+
+1. Create a Claude or Codex Task with `task-create` for the remaining work. Carry over the applicable prerequisites and gates. Copy any unconsumed instruction text shown by `status` into the replacement Task's `--goal`.
+2. If you transferred instructions, record `abandon <dispatch-id> --reason "Moved pending instructions to Task <new-task-id>"` on the old Dispatch. For a completed Dispatch with confirmed exit and recorded delivery, this lets `cleanup <run-id>` list the worktree when the other cleanup checks pass.
+3. In `status`, find blocked Tasks whose `dependencies` reference the old prerequisite ID. Recreate those Tasks in prerequisite order, including any downstream Tasks blocked by them. For each recreated Task, pass the replacement prerequisite IDs to `--after` or `--after-merge` according to the original dependency. Carry over any unaffected prerequisites and gates. Preserve the original Tasks and Dispatches for history.
+4. Reserve the new Task IDs as they become ready. A completion dependency needs a successful result from the replacement prerequisite. A merge dependency also needs a recorded `merged` for that prerequisite after its changes reach the Run's base branch.
 
 ### Codex coordinator
 
@@ -41,7 +58,7 @@ Pass the absolute DB path in the prompt. Use the saved thread ID every time and 
 
 ### agy coordinator
 
-Start an interactive agy session in the main checkout of the target repository.
+Use an interactive agy session started directly by the user in the main checkout of the target repository.
 
 ```sh
 agy
@@ -49,11 +66,11 @@ agy
 
 Use the same DB commands as the Claude and Codex hosts. Open the Run with `init`, `run-create`, and `task-create`. Dispatch workers with `reserve`, `begin`, and `started`. Track work with `wait`, `ack`, `status`, `turn-ended`, and `exited`. Finish with `delivered` and `cleanup`.
 
-Codex, Claude, and agy workers are allowed from an agy coordinator, using their respective sections below. Side sessions and `Agent` with `isolation: worktree` are available only in the Claude desktop app's Code tab.
+Use Codex or Claude workers from an agy coordinator, following their sections below. Side sessions and `Agent` with `isolation: worktree` are available only in the Claude desktop app's Code tab.
 
 Launch workers as background shell jobs. Save each worker's execution handle, PID and process start identity, and output and exit-status file paths. Poll with `wait <run-id> --timeout 30` and the saved handles. After each return, reconcile questions, `done` reports, and exits, then pass the returned cursor to `ack`. Record `exited` only after confirming the actual exit code. There is no host notification; worker completion does not start a new coordinator turn.
 
-Keep the coordinator turn active while workers run when possible. If you end the turn, save the coordinator's conversation ID and resume it explicitly.
+Keep the coordinator turn active while workers run when possible. If you end the turn, save the coordinator's conversation ID and have the user resume it explicitly.
 
 ```sh
 agy --conversation "$coordinator_conversation_id"
@@ -137,41 +154,6 @@ codex exec -C "$worktree" -s workspace-write --add-dir "$state_dir" \
 Record `turn.completed` or `turn.failed` with `turn-ended` when observed. After the host confirms process exit, call `exited` with the actual exit code. Check the DB for a `done` report before treating the Task as complete.
 
 If you missed the thread ID and the Dispatch is `turn-ended`, `waiting`, or closed with a completion report, read `thread.started` from the saved JSONL. Fill the missing ID for the current turn with `started <dispatch-id> --turn <turn> --session <thread-id>` before resuming.
-
-### agy worker
-
-Register Tasks with `--worker agy`. From a coordinator-owned background job with `cwd` set to the worktree, run the command below and save stdout and stderr per Dispatch and turn under the state directory. The brief cannot come from plain text stdin; pass it with `-p`. Both `state_dir` and `script_dir` must be inside `cwd` or an `--add-dir` because the sandbox blocks reads outside them. In a linked worktree, pass the Git common dir as an extra `--add-dir`; without it, `git` commands inside the sandbox fail with `fatal: not a git repository`.
-
-```sh
-(
-  cd "$worktree" || exit
-  agy --sandbox --add-dir "$state_dir" --add-dir "$script_dir" \
-    --settings "$settings" --output-format stream-json --print-timeout <limit> \
-    -p "$(cat "$brief_file")" < /dev/null
-)
-```
-
-Configure `$settings` with `permissions.allow` using the directory form `write_file(<worktree>)` and `command(*)` (for example, `{"permissions":{"allow":["write_file(<worktree>)","command(*)"]}}`). Glob forms (`write_file(<dir>/**)`) and specific command rules (`command(<word>)`) had no effect.
-
-Read `conversation_id` from the first (`init`) NDJSON line and save it with `started --session`. User hooks (such as `~/.gemini/config/hooks`) may spawn extra short-lived `agy` processes on each turn.
-
-For a follow-up, wait for the current process to exit and verify the recorded worktree and branch. Resume with `agy --conversation "$id"` and repeat every flag, because none persist across invocations.
-
-```sh
-(
-  cd "$worktree" || exit
-  agy --conversation "$id" --sandbox --add-dir "$state_dir" --add-dir "$script_dir" \
-    --settings "$settings" --output-format stream-json --print-timeout <limit> \
-    -p "$(cat "$brief_file")" < /dev/null
-)
-```
-
-Handle exit codes as follows:
-
-- `0`: completed. Permission denials also exit `0` with `status: "SUCCESS"`; check `result.denied_actions`, `ERROR` tool steps, on-disk effects, and DB writes before treating the turn as successful.
-- `1`: error. Exit `1` with an empty `conversation_id` is a transient start failure; retry after confirming no worker is running.
-- `2`: usage or flag error.
-- `3`: `--print-timeout` expired (`finished_reason: "print_timeout"`). Resume with the same conversation ID.
 
 ### Claude worker
 
@@ -307,7 +289,7 @@ If worker activity is still expected in the Claude desktop app's Code tab, start
 
 1. After confirming worker exit, read the completion report and check the branch and verification evidence. Check the full worktree status against the Task's edit scope. For working-tree changes, rerun the brief's Git commands and compare their patch output with the worker's report before staging. Deliver the branch, commit or diff, and verification evidence to the user and record delivery. For PR delivery, hand off to [ship-it](ship-it.md) when the user invokes it. For a merge dependency, confirm the required `verify` check passed and the specified default branch contains the needed change before recording the merge.
 2. Use `takeover` or `keep-open` before handing control to the user. Preserve the session and worktree in either case. Once the user takes over, stop sending instructions to the worker. Keep tracking the active turn until the host confirms it ended.
-3. Use `cleanup` to list linked worktree candidates with confirmed exit, recorded delivery, and no pending instructions. Retain worktrees without a report for manual reconciliation. Before removing a candidate, confirm team-up ownership and worker exit. Recheck the recorded path and branch against Git. Check `git status --porcelain --untracked-files=all` in the worktree and confirm all results are delivered. Skip any worktree with changes, an unknown worker state, or a preservation request. If the host already removed the worktree, reconcile that with Git instead of substituting another path.
+3. Use `cleanup` to list linked worktree candidates with confirmed exit and recorded delivery. Pending instructions block cleanup until consumed or the Dispatch is abandoned. Retain worktrees without a report for manual reconciliation. Before removing a candidate, confirm team-up ownership and worker exit. Recheck the recorded path and branch against Git. Check `git status --porcelain --untracked-files=all` in the worktree and confirm all results are delivered. Skip any worktree with changes, an unknown worker state, or a preservation request. If the host already removed the worktree, reconcile that with Git instead of substituting another path.
 4. Use regular `git worktree remove` after the checks pass. Preserve the branch, durable evidence, and DB. Delete the DB only on an explicit user request.
 
 ## Limits

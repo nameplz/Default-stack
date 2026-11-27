@@ -14,7 +14,7 @@ apply-stack → ship-it ← team-up, formal, explore
 | `ship-it` | Deliver a change as a pull request that merges itself once `verify` passes |
 | `formal` | Formally verify the riskiest property, keep the proof in line with the code, gate merges on it when it runs in about two minutes, otherwise run it on a schedule |
 | `explore` | Drive a release through the feature map and ship a fix PR for each bug reproduced twice, at most 5 per run |
-| `team-up` | Coordinate Claude, Codex, and agy workers in separate Git worktrees, or assign read-only reviews of the main checkout, from Claude Code, Codex CLI, or agy, with Run state in SQLite |
+| `team-up` | Coordinate Claude and Codex workers in separate Git worktrees, or assign read-only reviews of the main checkout, from Claude Code, Codex CLI, or interactive agy, with Run state in SQLite |
 
 Every skill runs only when you invoke it. Docs go to existing project docs when they fit, otherwise to `docs/default-stack/`.
 
@@ -68,7 +68,9 @@ agy: pull this repository, then rerun `agy plugin install ./plugin`.
 
 ## Team-up
 
-Run `/default-stack:team-up` in the Claude desktop app's Code tab, the Claude Code CLI, or an interactive agy session, or invoke `$default-stack:team-up` in an interactive Codex CLI session. Install Python 3 with SQLite's WAL-reset fix (SQLite 3.51.3+, or the 3.44.6+/3.50.7+ backports; `init` and `status` warn otherwise) and the CLI for each external worker type you use (Claude, Codex, or agy). See the [coordinator guide](plugin/references/team-up.md).
+Run `/default-stack:team-up` in the Claude desktop app's Code tab, the Claude Code CLI, or an interactive agy session you start directly, or invoke `$default-stack:team-up` in an interactive Codex CLI session. Install Python 3 with SQLite's WAL-reset fix (SQLite 3.51.3+, or the 3.44.6+/3.50.7+ backports; `init` and `status` warn otherwise) and the CLI for each external worker type you use (Claude or Codex). See the [coordinator guide](plugin/references/team-up.md).
+
+agy worker dispatch is disabled. Google's [Antigravity terms §6](https://antigravity.google/terms) and [FAQ](https://antigravity.google/docs/faq) prohibit third-party agent orchestration with consumer sign-in. team-up does not distinguish authentication types, so it disables agy worker dispatch for all accounts. Existing agy records remain available for inspection, shutdown reconciliation, result delivery, and cleanup; see [existing agy records](plugin/references/team-up.md#existing-agy-records).
 
 Run state uses schema v4. Running `init` upgrades a v3 DB in place (pass the same `--db` if you use a custom path); other commands on a v3 DB ask for `init` first. v2 and older DBs need a new `--db` path; keep the old DB for its Run history.
 

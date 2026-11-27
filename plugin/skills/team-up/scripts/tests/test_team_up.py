@@ -1,6 +1,7 @@
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -161,11 +162,25 @@ class TeamUpTest(unittest.TestCase):
             """)
             db.execute("INSERT INTO repository VALUES (1, ?)", (str(Path(repo_common_dir).resolve()),))
 
-    def task(self, run, goal, *constraints):
+    def task(self, run, goal, *constraints, worker="codex"):
         return self.invoke(
-            "task-create", run, "--worker", "codex", "--goal", goal,
+            "task-create", run, "--worker", worker, "--goal", goal,
             "--scope", "src/", "--evidence", "Show the verification result", *constraints,
         )["id"]
+
+    def make_legacy_agy(self, task):
+        # Lifecycle state is identical in v4; restore the old worker identity after setup.
+        with closing(sqlite3.connect(self.db)) as db, db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
+            db.execute("UPDATE tasks SET worker = 'agy' WHERE id = ?", (task,))
+
+    def assert_legacy_execution_rejected(self, *args, error="worker 'agy' is not supported for new work"):
+        with closing(sqlite3.connect(self.db)) as db:
+            before = list(db.iterdump())
+        result = self.invoke(*args, expected=1)
+        self.assertIn(error, result.stderr)
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual(list(db.iterdump()), before)
 
     def begin(self, dispatch):
         return self.invoke("begin", dispatch)["turn"]
@@ -355,13 +370,154 @@ class TeamUpTest(unittest.TestCase):
             with self.assertRaises(sqlite3.IntegrityError):
                 db.execute("UPDATE tasks SET worker = 'unknown' WHERE id = 19")
 
-        task_id = self.invoke(
+        result = self.invoke(
             "task-create", 7, "--worker", "agy", "--goal", "Verify",
             "--scope", "src/", "--evidence", "Show the verification result",
-        )["id"]
+            expected=2,
+        )
+        self.assertIn("invalid choice: 'agy'", result.stderr)
         self.assertEqual(self.invoke("init")["schema_version"], 4)
         with sqlite3.connect(self.db) as db:
-            self.assertEqual(db.execute("SELECT worker FROM tasks WHERE id = ?", (task_id,)).fetchone(), ("agy",))
+            self.assertEqual([line for line in db.iterdump() if line.startswith("INSERT INTO ")], original_rows)
+
+    def test_active_workers_run_while_legacy_agy_reservations_are_blocked(self):
+        run = self.run_create(slots=1)
+        legacy = self.task(run, "Old unassigned task")
+        self.make_legacy_agy(legacy)
+        active = [self.task(run, f"New {worker} task", worker=worker) for worker in ("claude", "codex")]
+
+        self.assert_legacy_execution_rejected("reserve", run, "--task", legacy)
+        for task in active:
+            dispatch = self.invoke("reserve", run)
+            self.assertEqual(dispatch["task_id"], task)
+            turn = self.begin(dispatch["id"])
+            self.started(dispatch["id"], turn)
+            self.report(dispatch["id"], turn)
+            self.exit_worker(dispatch["id"], turn)
+        self.assertIsNone(self.invoke("reserve", run))
+        self.assertEqual(self.invoke("status", run)["tasks"][0]["worker"], "agy")
+
+    def test_legacy_agy_cannot_retry_even_with_override(self):
+        run = self.run_create()
+        task = self.task(run, "Old failed task")
+        dispatch, turn = self.start(run, task)
+        self.exit_worker(dispatch, turn, code=1)
+        self.make_legacy_agy(task)
+
+        self.assert_legacy_execution_rejected("retry", dispatch)
+        self.assert_legacy_execution_rejected("retry", dispatch, "--override")
+
+    def test_legacy_agy_cannot_begin_reserved_waiting_or_completed_turns(self):
+        worktree = self.linked_worktree()
+        directory = self.db.parent
+        for phase in ("reserved", "waiting", "completed"):
+            with self.subTest(phase=phase):
+                self.db = directory / f"{phase}.db"
+                self.command = [sys.executable, "-B", str(SCRIPT), "--db", str(self.db)]
+                run = self.run_create(slots=1)
+                task = self.task(run, f"Old {phase} task")
+                spec = ("--worktree", worktree, "--branch", "assigned")
+                if phase == "reserved":
+                    dispatch = self.invoke(
+                        "reserve", run, "--task", task,
+                        "--worktree", directory / "uncreated worktree", "--branch", "missing",
+                    )["id"]
+                else:
+                    dispatch, turn = self.start(run, task, *spec)
+                    if phase == "waiting":
+                        question = self.invoke("record", dispatch, "--turn", turn, "Which path?")
+                        self.invoke("answer", question["id"], "Use path A")
+                    else:
+                        self.report(dispatch, turn)
+                    self.exit_worker(dispatch, turn)
+                    if phase == "completed":
+                        self.invoke("delivered", dispatch)
+                        self.invoke("instruct", dispatch, "Review one more file")
+                self.make_legacy_agy(task)
+
+                self.assert_legacy_execution_rejected("begin", dispatch)
+                if phase == "completed":
+                    self.assertEqual(self.invoke("cleanup", run), [])
+                    instruction = self.invoke("status", run)["messages"][0]
+                    self.assertEqual((instruction["kind"], instruction["consumed"]), ("instruction", 0))
+                    replacement = self.task(run, instruction["text"])
+                    self.invoke("abandon", dispatch, "--reason", f"Moved instruction to Task {replacement}")
+                    self.assertEqual([item["id"] for item in self.invoke("cleanup", run)], [dispatch])
+
+    def test_legacy_agy_cannot_register_a_begun_turn_without_runtime(self):
+        worktree = self.linked_worktree()
+        run = self.run_create()
+        task = self.task(run, "Old task with an unregistered turn")
+        dispatch = self.invoke("reserve", run, "--task", task)["id"]
+        turn = self.begin(dispatch)
+        self.make_legacy_agy(task)
+
+        spec = ("--worktree", worktree, "--branch", "assigned")
+        start = ("--runtime", "job", "--session", "session")
+        for command, options in (("register", spec), ("started", start), ("started", start + spec)):
+            with self.subTest(command=command, options=options):
+                self.assert_legacy_execution_rejected(command, dispatch, "--turn", turn, *options)
+        self.invoke("stop", dispatch)
+        closed = self.exit_worker(dispatch, turn, "--stopped")
+        self.assertEqual((closed["phase"], closed["outcome"]), ("closed", "stopped"))
+
+    def test_legacy_agy_rejects_answers_and_instructions(self):
+        run = self.run_create()
+        task = self.task(run, "Old task with a pending question")
+        dispatch, turn = self.start(run, task)
+        question = self.invoke("record", dispatch, "--turn", turn, "Which path?")
+        self.exit_worker(dispatch, turn)
+        self.make_legacy_agy(task)
+
+        error = "worker 'agy' is disabled and will not be resumed"
+        for command, target, message in (
+            ("answer", question["id"], "Use path A"),
+            ("instruct", dispatch, "Review one more file"),
+        ):
+            with self.subTest(command=command):
+                self.assert_legacy_execution_rejected(command, target, message, error=error)
+
+    def test_legacy_agy_records_can_be_reported_stopped_and_cleaned_up(self):
+        worktree = self.linked_worktree()
+        run = self.run_create(slots=1)
+        task = self.task(run, "Old running task with results")
+        spec = ("--worktree", worktree, "--branch", "assigned")
+        dispatch, turn = self.start(run, task, *spec)
+        self.make_legacy_agy(task)
+        self.assertEqual(self.invoke("status", run)["tasks"][0]["worker"], "agy")
+
+        report = self.report(dispatch, turn)
+        self.assertEqual(report["task"]["worker"], "agy")
+        self.invoke("turn-ended", dispatch, "--turn", turn)
+        self.exit_worker(dispatch, turn)
+        self.assertEqual(self.invoke("cleanup", run), [])
+        self.invoke("delivered", dispatch)
+        self.assertEqual([item["id"] for item in self.invoke("cleanup", run)], [dispatch])
+
+        for phase in ("running", "reserved", "waiting"):
+            with self.subTest(phase=phase):
+                run = self.run_create(slots=1)
+                stopped_task = self.task(run, f"Old {phase} task to stop")
+                if phase == "reserved":
+                    stopped = self.invoke("reserve", run, "--task", stopped_task)["id"]
+                else:
+                    stopped, stopped_turn = self.start(run, stopped_task)
+                    if phase == "waiting":
+                        self.invoke("record", stopped, "--turn", stopped_turn, "Which path?")
+                        self.assertEqual(self.exit_worker(stopped, stopped_turn)["phase"], "waiting")
+                self.make_legacy_agy(stopped_task)
+                next_task = self.task(run, "New task waiting for a slot")
+                closed = self.invoke("stop", stopped)
+                outcome = "stopped"
+                if phase != "reserved":
+                    self.assertEqual(closed["phase"], phase)
+                    if phase == "running":
+                        self.invoke("abandon", stopped, "--reason", "Worker no longer supported")
+                        outcome = "abandoned"
+                    self.assertIsNone(self.invoke("reserve", run, "--task", next_task))
+                    closed = self.exit_worker(stopped, stopped_turn, "--stopped")
+                self.assertEqual((closed["phase"], closed["outcome"]), ("closed", outcome))
+                self.assertEqual(self.invoke("reserve", run)["task_id"], next_task)
 
     def test_non_init_on_v3_suggests_init_on_the_same_database(self):
         self.create_v3()

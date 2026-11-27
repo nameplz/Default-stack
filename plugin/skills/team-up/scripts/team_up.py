@@ -16,6 +16,8 @@ import time
 
 
 SCHEMA_VERSION = 4
+ACTIVE_WORKERS = ("claude", "codex")
+# Keep agy in schema v4 for historical records; ACTIVE_WORKERS governs new work.
 TASKS_SCHEMA = """CREATE TABLE {} (
     id INTEGER PRIMARY KEY,
     run_id INTEGER NOT NULL REFERENCES runs(id),
@@ -321,7 +323,14 @@ def create_run(db, args):
     return dict(run_row(db, run_id))
 
 
+def check_active_worker(worker):
+    if worker not in ACTIVE_WORKERS:
+        raise StateError(f"worker {worker!r} is not supported for new work; use claude or codex. "
+                         "Existing records can still be inspected and closed.")
+
+
 def create_task(db, args):
+    check_active_worker(args.worker)
     run_row(db, args.run)
     dependencies = dict.fromkeys(args.after, "finish")
     dependencies.update(dict.fromkeys(args.after_merge, "merge"))
@@ -381,9 +390,10 @@ def mark_merged(db, args):
         return dict(task_row(db, args.task))
 
 
-READY = """
+READY = f"""
     SELECT t.* FROM tasks t
     WHERE t.run_id = ? AND (? IS NULL OR t.id = ?)
+      AND t.worker IN ({', '.join('?' for _ in ACTIVE_WORKERS)})
       AND NOT EXISTS (SELECT 1 FROM dispatches d WHERE d.task_id = t.id)
       AND NOT EXISTS (
           SELECT 1 FROM dependencies dep JOIN tasks p ON p.id = dep.prerequisite_id
@@ -449,6 +459,7 @@ def check_worktree_claim(db, path, dispatch_id=None):
 
 
 def insert_dispatch(db, task, worktree, branch, attempt=1, retry_of=None, review_main=False):
+    check_active_worker(task["worker"])
     if review_main and worktree is None:
         raise StateError("--review-main requires --worktree and --branch")
     if worktree:
@@ -468,12 +479,15 @@ def insert_dispatch(db, task, worktree, branch, attempt=1, retry_of=None, review
 
 def reserve(db, args):
     run = run_row(db, args.run)
-    if args.task is not None and task_row(db, args.task)["run_id"] != args.run:
-        raise StateError("the task belongs to another run")
+    if args.task is not None:
+        task = task_row(db, args.task)
+        if task["run_id"] != args.run:
+            raise StateError("the task belongs to another run")
+        check_active_worker(task["worker"])
     worktree, branch = worktree_spec(args)
     if not slot_available(db, run):
         return None
-    task = db.execute(READY, (args.run, args.task, args.task)).fetchone()
+    task = db.execute(READY, (args.run, args.task, args.task, *ACTIVE_WORKERS)).fetchone()
     if task is None:
         return None
     return insert_dispatch(db, task, worktree, branch, review_main=args.review_main)
@@ -527,6 +541,7 @@ def questions(db, dispatch):
 
 def begin(db, args):
     snapshot = dispatch_row(db, args.dispatch)
+    check_active_worker(task_row(db, snapshot["task_id"])["worker"])
     if snapshot["worktree"]:
         check_worktree(db, snapshot["worktree"], snapshot["branch"], snapshot["review_main"])
     with transaction(db):
@@ -583,11 +598,18 @@ def save_worktree(db, dispatch, worktree, branch):
     dispatch_event(db, dispatch, "worktree-registered", worktree=worktree, branch=branch)
 
 
+def check_start_registration(db, dispatch):
+    if dispatch["runtime"] is None and dispatch["phase"] in ("running", "turn-ended"):
+        check_active_worker(task_row(db, dispatch["task_id"])["worker"])
+
+
 def register(db, args):
     worktree, branch = worktree_spec(args)
     check_worktree(db, worktree, branch, dispatch_row(db, args.dispatch)["review_main"])
     with transaction(db):
-        save_worktree(db, current_turn(db, args), worktree, branch)
+        dispatch = current_turn(db, args)
+        check_start_registration(db, dispatch)
+        save_worktree(db, dispatch, worktree, branch)
         return brief(db, args.dispatch)
 
 
@@ -597,6 +619,7 @@ def started(db, args):
         check_worktree(db, worktree, branch, dispatch_row(db, args.dispatch)["review_main"])
     with transaction(db):
         dispatch = current_turn(db, args)
+        check_start_registration(db, dispatch)
         phase = dispatch["phase"]
         recovering = phase == "waiting" or (phase == "closed" and dispatch["evidence"])
         if phase not in ("running", "turn-ended") and not recovering:
@@ -728,15 +751,22 @@ def record_question(db, args):
     return {"id": message_id, "dispatch_id": args.dispatch, "turn": args.turn, "text": args.question}
 
 
+def check_resumable_worker(db, dispatch):
+    worker = task_row(db, dispatch["task_id"])["worker"]
+    if worker not in ACTIVE_WORKERS:
+        raise StateError(f"worker {worker!r} is disabled and will not be resumed")
+
+
 def answer_question(db, args):
     message = db.execute("SELECT * FROM messages WHERE id = ? AND kind = 'question'", (args.question_id,)).fetchone()
     if message is None:
         raise StateError(f"unknown question {args.question_id}")
+    dispatch = dispatch_row(db, message["dispatch_id"])
+    check_resumable_worker(db, dispatch)
     if message["answer"] is not None:
         if message["answer"] != args.answer:
             raise StateError("the question already has a different answer")
         return dict(message)
-    dispatch = dispatch_row(db, message["dispatch_id"])
     if (dispatch["phase"] == "closed" or dispatch["stop_requested"] or dispatch["evidence"]
             or message["turn"] != dispatch["turn"]):
         raise StateError("the dispatch no longer accepts answers")
@@ -766,6 +796,7 @@ def ask(db, args):
 
 def instruct(db, args):
     dispatch = dispatch_row(db, args.dispatch)
+    check_resumable_worker(db, dispatch)
     if (dispatch["stop_requested"] or dispatch["taken_over"] or dispatch["abandon_reason"]
             or (dispatch["phase"] == "closed" and not dispatch["evidence"])):
         raise StateError("the dispatch no longer accepts instructions")
@@ -978,7 +1009,7 @@ def parser():
     run.add_argument("--base", type=nonempty)
 
     task = command("task-create", create_task, "run")
-    task.add_argument("--worker", choices=("claude", "codex", "agy"), required=True)
+    task.add_argument("--worker", choices=ACTIVE_WORKERS, required=True)
     for option in ("goal", "scope", "evidence"):
         task.add_argument(f"--{option}", type=nonempty, required=True)
     for option in ("after", "after-merge"):
