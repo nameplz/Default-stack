@@ -541,11 +541,11 @@ def questions(db, dispatch):
 
 def begin(db, args):
     snapshot = dispatch_row(db, args.dispatch)
+    check_active_worker(task_row(db, snapshot["task_id"])["worker"])
     if snapshot["worktree"]:
         check_worktree(db, snapshot["worktree"], snapshot["branch"], snapshot["review_main"])
     with transaction(db):
         dispatch = dispatch_row(db, args.dispatch)
-        check_active_worker(task_row(db, dispatch["task_id"])["worker"])
         if (dispatch["worktree"], dispatch["branch"]) != (snapshot["worktree"], snapshot["branch"]):
             raise StateError("the worktree changed before the turn could begin; check status")
         if dispatch["stop_requested"] or dispatch["taken_over"] or dispatch["abandon_reason"]:
@@ -598,11 +598,18 @@ def save_worktree(db, dispatch, worktree, branch):
     dispatch_event(db, dispatch, "worktree-registered", worktree=worktree, branch=branch)
 
 
+def check_start_registration(db, dispatch):
+    if dispatch["runtime"] is None and dispatch["phase"] in ("running", "turn-ended"):
+        check_active_worker(task_row(db, dispatch["task_id"])["worker"])
+
+
 def register(db, args):
     worktree, branch = worktree_spec(args)
     check_worktree(db, worktree, branch, dispatch_row(db, args.dispatch)["review_main"])
     with transaction(db):
-        save_worktree(db, current_turn(db, args), worktree, branch)
+        dispatch = current_turn(db, args)
+        check_start_registration(db, dispatch)
+        save_worktree(db, dispatch, worktree, branch)
         return brief(db, args.dispatch)
 
 
@@ -612,6 +619,7 @@ def started(db, args):
         check_worktree(db, worktree, branch, dispatch_row(db, args.dispatch)["review_main"])
     with transaction(db):
         dispatch = current_turn(db, args)
+        check_start_registration(db, dispatch)
         phase = dispatch["phase"]
         recovering = phase == "waiting" or (phase == "closed" and dispatch["evidence"])
         if phase not in ("running", "turn-ended") and not recovering:
@@ -743,15 +751,22 @@ def record_question(db, args):
     return {"id": message_id, "dispatch_id": args.dispatch, "turn": args.turn, "text": args.question}
 
 
+def check_resumable_worker(db, dispatch):
+    worker = task_row(db, dispatch["task_id"])["worker"]
+    if worker not in ACTIVE_WORKERS:
+        raise StateError(f"worker {worker!r} is disabled and will not be resumed")
+
+
 def answer_question(db, args):
     message = db.execute("SELECT * FROM messages WHERE id = ? AND kind = 'question'", (args.question_id,)).fetchone()
     if message is None:
         raise StateError(f"unknown question {args.question_id}")
+    dispatch = dispatch_row(db, message["dispatch_id"])
+    check_resumable_worker(db, dispatch)
     if message["answer"] is not None:
         if message["answer"] != args.answer:
             raise StateError("the question already has a different answer")
         return dict(message)
-    dispatch = dispatch_row(db, message["dispatch_id"])
     if (dispatch["phase"] == "closed" or dispatch["stop_requested"] or dispatch["evidence"]
             or message["turn"] != dispatch["turn"]):
         raise StateError("the dispatch no longer accepts answers")
@@ -781,6 +796,7 @@ def ask(db, args):
 
 def instruct(db, args):
     dispatch = dispatch_row(db, args.dispatch)
+    check_resumable_worker(db, dispatch)
     if (dispatch["stop_requested"] or dispatch["taken_over"] or dispatch["abandon_reason"]
             or (dispatch["phase"] == "closed" and not dispatch["evidence"])):
         raise StateError("the dispatch no longer accepts instructions")
