@@ -16,6 +16,8 @@ import time
 
 
 SCHEMA_VERSION = 4
+ACTIVE_WORKERS = ("claude", "codex")
+# Keep agy in schema v4 for historical records; ACTIVE_WORKERS governs new work.
 TASKS_SCHEMA = """CREATE TABLE {} (
     id INTEGER PRIMARY KEY,
     run_id INTEGER NOT NULL REFERENCES runs(id),
@@ -321,7 +323,14 @@ def create_run(db, args):
     return dict(run_row(db, run_id))
 
 
+def check_active_worker(worker):
+    if worker not in ACTIVE_WORKERS:
+        raise StateError(f"worker {worker!r} is not supported for new work; use claude or codex. "
+                         "Existing records can still be inspected and closed.")
+
+
 def create_task(db, args):
+    check_active_worker(args.worker)
     run_row(db, args.run)
     dependencies = dict.fromkeys(args.after, "finish")
     dependencies.update(dict.fromkeys(args.after_merge, "merge"))
@@ -381,9 +390,10 @@ def mark_merged(db, args):
         return dict(task_row(db, args.task))
 
 
-READY = """
+READY = f"""
     SELECT t.* FROM tasks t
     WHERE t.run_id = ? AND (? IS NULL OR t.id = ?)
+      AND t.worker IN ({', '.join('?' for _ in ACTIVE_WORKERS)})
       AND NOT EXISTS (SELECT 1 FROM dispatches d WHERE d.task_id = t.id)
       AND NOT EXISTS (
           SELECT 1 FROM dependencies dep JOIN tasks p ON p.id = dep.prerequisite_id
@@ -449,6 +459,7 @@ def check_worktree_claim(db, path, dispatch_id=None):
 
 
 def insert_dispatch(db, task, worktree, branch, attempt=1, retry_of=None, review_main=False):
+    check_active_worker(task["worker"])
     if review_main and worktree is None:
         raise StateError("--review-main requires --worktree and --branch")
     if worktree:
@@ -468,12 +479,15 @@ def insert_dispatch(db, task, worktree, branch, attempt=1, retry_of=None, review
 
 def reserve(db, args):
     run = run_row(db, args.run)
-    if args.task is not None and task_row(db, args.task)["run_id"] != args.run:
-        raise StateError("the task belongs to another run")
+    if args.task is not None:
+        task = task_row(db, args.task)
+        if task["run_id"] != args.run:
+            raise StateError("the task belongs to another run")
+        check_active_worker(task["worker"])
     worktree, branch = worktree_spec(args)
     if not slot_available(db, run):
         return None
-    task = db.execute(READY, (args.run, args.task, args.task)).fetchone()
+    task = db.execute(READY, (args.run, args.task, args.task, *ACTIVE_WORKERS)).fetchone()
     if task is None:
         return None
     return insert_dispatch(db, task, worktree, branch, review_main=args.review_main)
@@ -531,6 +545,7 @@ def begin(db, args):
         check_worktree(db, snapshot["worktree"], snapshot["branch"], snapshot["review_main"])
     with transaction(db):
         dispatch = dispatch_row(db, args.dispatch)
+        check_active_worker(task_row(db, dispatch["task_id"])["worker"])
         if (dispatch["worktree"], dispatch["branch"]) != (snapshot["worktree"], snapshot["branch"]):
             raise StateError("the worktree changed before the turn could begin; check status")
         if dispatch["stop_requested"] or dispatch["taken_over"] or dispatch["abandon_reason"]:
@@ -978,7 +993,7 @@ def parser():
     run.add_argument("--base", type=nonempty)
 
     task = command("task-create", create_task, "run")
-    task.add_argument("--worker", choices=("claude", "codex", "agy"), required=True)
+    task.add_argument("--worker", choices=ACTIVE_WORKERS, required=True)
     for option in ("goal", "scope", "evidence"):
         task.add_argument(f"--{option}", type=nonempty, required=True)
     for option in ("after", "after-merge"):

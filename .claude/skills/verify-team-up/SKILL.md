@@ -37,7 +37,7 @@ Read the chosen [feature recipe](features/README.md). Start a fresh sandbox and 
 
 Replace `lifecycle` with `questions`, `gate`, `instructions`, or `review-main` to run that recipe. Exit 0 means PASS, exit 1 means a user-facing check is FAILING, and exit 2 means the helper could not finish. Inspect the transcript before classifying an interrupted drive. Clean up after each attempt.
 
-The helper runs the coordinator commands as CLI subprocesses in the disposable repository. It runs worker commands as separate CLI subprocesses in the assigned checkout. Runtime handles and session IDs identify shell-role turns. An optional live Claude Code, Codex CLI, or agy coordinator run with Claude Code, Codex, or agy workers requires a separate verification pass covering host launch, permissions, notifications or shell-handle polling, and real session resume.
+The helper runs the coordinator commands as CLI subprocesses in the disposable repository. It runs worker commands as separate CLI subprocesses in the assigned checkout. Runtime handles and session IDs identify shell-role turns. An optional live Claude Code, Codex CLI, or user-started interactive agy coordinator run with Claude Code or Codex workers requires a separate verification pass covering host launch, permissions, notifications or shell-handle polling, and real session resume.
 
 ## Evidence
 

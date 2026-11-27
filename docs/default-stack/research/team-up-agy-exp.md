@@ -1,5 +1,7 @@
 # agy as a team-up worker — experiment log
 
+Historical record of the 2026-11-24 experiments. team-up no longer supports agy workers; the commands and recommendations below are preserved as experiment history, not current execution guidance. See the [current decision](../decisions.md).
+
 agy 1.5.16 (`agy --version`, exit 0), macOS, 2026-11-24.
 
 Scratch area: `/Users/yuhyeon/.local/state/default-stack/team-up/r3-agy-exp` (`$E`).
@@ -197,7 +199,7 @@ exit=0
 - **Unverified:** `agy acp` (an Agent Client Protocol stdio server) keeps a turn open across background wake-ups (changelog line 33). It could serve as a programmatic coordinator transport.
 - Print mode without `--print-timeout` waits for background tasks (changelog line 308). A coordinator should always set `--print-timeout`.
 
-## Recommended worker launch/resume commands
+## Historical worker launch/resume commands
 
 ```sh
 cd "$WORKTREE"

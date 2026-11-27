@@ -2,6 +2,8 @@
 
 Use one coordinator for one active Run in one local Git repository. Start only workers owned by the Run. Keep their execution handles and SQLite records so you can recover after a coordinator restart.
 
+Use `claude` or `codex` for new Tasks. agy remains available as an interactive coordinator that the user starts directly.
+
 ## Identify the host and open the Run
 
 1. In the Claude desktop app's Code tab, use the host's side-session tools when they are available. Note whether the current turn came from the user or a background notification. In the Claude Code CLI, use shell jobs for external workers. In an interactive Codex CLI session, follow the [Codex coordinator procedure](#codex-coordinator). In an interactive agy session, follow the [agy coordinator procedure](#agy-coordinator).
@@ -13,6 +15,16 @@ Use one coordinator for one active Run in one local Git repository. Start only w
 Use the local script's `--help` for command arguments. The examples put `--db` before the subcommand. Replace the shell variables and example values with the actual Run values. Replace the example `python3` with the selected executable if you use a different one.
 
 Running `init` upgrades a schema v3 DB to v4 in place; other commands on v3 ask for `init` first. Schema v2 and older DBs still require a new absolute `--db` path to `init`; keep the old DB for its Run history.
+
+### Existing agy records
+
+agy worker dispatch is no longer supported. Google's [Antigravity Terms of Service §6](https://antigravity.google/terms) and [FAQ](https://antigravity.google/docs/faq) prohibit third-party agent orchestration with consumer sign-in. team-up does not inspect authentication, so it blocks agy workers for all authentication types.
+
+Keep schema v4 and all saved agy Tasks, Dispatches, events, and evidence. New agy Tasks, reservations, retries, and turns are blocked; automatic reservation skips saved agy Tasks. Use `status <run-id>` to inspect Tasks, Dispatches with completion evidence, and messages, and `wait <run-id> --timeout 0` to read unacknowledged `question` and `done` events.
+
+To wind down a live agy Dispatch, record `stop` and ask its host to terminate that exact process. `stop` only records a request; it does not stop the process. Keep the slot and worktree while liveness is unknown. After confirming termination, record `exited --stopped` with the actual exit code and current turn. For an already exited process, reconcile its actual exit with `exited`. Preserve saved results and follow the usual [delivery and cleanup checks](#deliver-and-clean-up).
+
+Do not resume or retry an agy session. If unfinished work still needs execution, plan a new Claude or Codex Task after confirming that no old worker is running. Review dependencies when planning the replacement. Preserve the original Task and Dispatch; there is no automatic conversion.
 
 ### Codex coordinator
 
@@ -41,7 +53,7 @@ Pass the absolute DB path in the prompt. Use the saved thread ID every time and 
 
 ### agy coordinator
 
-Start an interactive agy session in the main checkout of the target repository.
+Use an interactive agy session started directly by the user in the main checkout of the target repository.
 
 ```sh
 agy
@@ -49,11 +61,11 @@ agy
 
 Use the same DB commands as the Claude and Codex hosts. Open the Run with `init`, `run-create`, and `task-create`. Dispatch workers with `reserve`, `begin`, and `started`. Track work with `wait`, `ack`, `status`, `turn-ended`, and `exited`. Finish with `delivered` and `cleanup`.
 
-Codex, Claude, and agy workers are allowed from an agy coordinator, using their respective sections below. Side sessions and `Agent` with `isolation: worktree` are available only in the Claude desktop app's Code tab.
+Use Codex or Claude workers from an agy coordinator, following their sections below. Side sessions and `Agent` with `isolation: worktree` are available only in the Claude desktop app's Code tab.
 
 Launch workers as background shell jobs. Save each worker's execution handle, PID and process start identity, and output and exit-status file paths. Poll with `wait <run-id> --timeout 30` and the saved handles. After each return, reconcile questions, `done` reports, and exits, then pass the returned cursor to `ack`. Record `exited` only after confirming the actual exit code. There is no host notification; worker completion does not start a new coordinator turn.
 
-Keep the coordinator turn active while workers run when possible. If you end the turn, save the coordinator's conversation ID and resume it explicitly.
+Keep the coordinator turn active while workers run when possible. If you end the turn, save the coordinator's conversation ID and have the user resume it explicitly.
 
 ```sh
 agy --conversation "$coordinator_conversation_id"
@@ -137,41 +149,6 @@ codex exec -C "$worktree" -s workspace-write --add-dir "$state_dir" \
 Record `turn.completed` or `turn.failed` with `turn-ended` when observed. After the host confirms process exit, call `exited` with the actual exit code. Check the DB for a `done` report before treating the Task as complete.
 
 If you missed the thread ID and the Dispatch is `turn-ended`, `waiting`, or closed with a completion report, read `thread.started` from the saved JSONL. Fill the missing ID for the current turn with `started <dispatch-id> --turn <turn> --session <thread-id>` before resuming.
-
-### agy worker
-
-Register Tasks with `--worker agy`. From a coordinator-owned background job with `cwd` set to the worktree, run the command below and save stdout and stderr per Dispatch and turn under the state directory. The brief cannot come from plain text stdin; pass it with `-p`. Both `state_dir` and `script_dir` must be inside `cwd` or an `--add-dir` because the sandbox blocks reads outside them. In a linked worktree, pass the Git common dir as an extra `--add-dir`; without it, `git` commands inside the sandbox fail with `fatal: not a git repository`.
-
-```sh
-(
-  cd "$worktree" || exit
-  agy --sandbox --add-dir "$state_dir" --add-dir "$script_dir" \
-    --settings "$settings" --output-format stream-json --print-timeout <limit> \
-    -p "$(cat "$brief_file")" < /dev/null
-)
-```
-
-Configure `$settings` with `permissions.allow` using the directory form `write_file(<worktree>)` and `command(*)` (for example, `{"permissions":{"allow":["write_file(<worktree>)","command(*)"]}}`). Glob forms (`write_file(<dir>/**)`) and specific command rules (`command(<word>)`) had no effect.
-
-Read `conversation_id` from the first (`init`) NDJSON line and save it with `started --session`. User hooks (such as `~/.gemini/config/hooks`) may spawn extra short-lived `agy` processes on each turn.
-
-For a follow-up, wait for the current process to exit and verify the recorded worktree and branch. Resume with `agy --conversation "$id"` and repeat every flag, because none persist across invocations.
-
-```sh
-(
-  cd "$worktree" || exit
-  agy --conversation "$id" --sandbox --add-dir "$state_dir" --add-dir "$script_dir" \
-    --settings "$settings" --output-format stream-json --print-timeout <limit> \
-    -p "$(cat "$brief_file")" < /dev/null
-)
-```
-
-Handle exit codes as follows:
-
-- `0`: completed. Permission denials also exit `0` with `status: "SUCCESS"`; check `result.denied_actions`, `ERROR` tool steps, on-disk effects, and DB writes before treating the turn as successful.
-- `1`: error. Exit `1` with an empty `conversation_id` is a transient start failure; retry after confirming no worker is running.
-- `2`: usage or flag error.
-- `3`: `--print-timeout` expired (`finished_reason: "print_timeout"`). Resume with the same conversation ID.
 
 ### Claude worker
 
