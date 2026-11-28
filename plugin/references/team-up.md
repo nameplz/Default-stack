@@ -14,13 +14,13 @@ Use `claude` or `codex` for new Tasks. agy remains available as an interactive c
 
 Use the local script's `--help` for command arguments. The examples put `--db` before the subcommand. Replace the shell variables and example values with the actual Run values. Replace the example `python3` with the selected executable if you use a different one.
 
-Running `init` upgrades a schema v3 DB to v4 in place; other commands on v3 ask for `init` first. Schema v2 and older DBs still require a new absolute `--db` path to `init`; keep the old DB for its Run history.
+Run `init` to upgrade a schema v3 or v4 DB to v5 in place. For schema v2 and older, run `init` with a new absolute `--db` path. Keep the old DB for its Run history.
 
 ### Existing agy records
 
 agy worker dispatch is no longer supported. Google's [Antigravity Terms of Service §6](https://antigravity.google/terms) and [FAQ](https://antigravity.google/docs/faq) prohibit third-party agent orchestration with consumer sign-in. team-up does not inspect authentication, so it blocks agy workers for all authentication types.
 
-Keep schema v4 and all saved agy Tasks, Dispatches, events, and evidence. team-up blocks new agy Tasks, reservations, retries, turns, answers, and instructions. Automatic reservation skips saved agy Tasks. If the Dispatch is `running` or `turn-ended` and has no recorded runtime, team-up also rejects `register` and `started`. Use `status <run-id>` to inspect Tasks, Dispatches with completion evidence, dependencies, and messages. Use `wait <run-id> --timeout 0` to read unacknowledged `question` and `done` events.
+Schema v5 preserves saved agy Tasks, Dispatches, events, and evidence. team-up blocks new agy Tasks, reservations, retries, turns, answers, and instructions. Automatic reservation skips saved agy Tasks. If the Dispatch is `running` or `turn-ended` and has no recorded runtime, team-up also rejects `register` and `started`. Use `status <run-id>` to inspect Tasks, Dispatches with completion evidence, dependencies, and messages. Use `wait <run-id> --timeout 0` to read unacknowledged `question` and `done` events.
 
 Use `stop <dispatch-id>` to close a reservation that never began. For a begun Dispatch, record `stop` and ask the host to terminate that exact worker if it is still live. Keep the slot and worktree while liveness is unknown, even if the Dispatch has no runtime handle. After confirming shutdown, record `exited <dispatch-id> --turn <turn> --code <exit-code> --stopped`. If the worker exited on its own and no stop was requested, reconcile the actual exit with `exited`. Preserve saved results and follow the usual [delivery and cleanup checks](#deliver-and-clean-up).
 
@@ -96,6 +96,8 @@ Call `begin <dispatch-id>` immediately before starting or resuming the worker. U
 
 Give each worker a filled-in brief. Include the exact commands with concrete paths and IDs.
 
+Use `note <run-id> <text>` as coordinator to record decisions, conventions, and pitfalls that apply across Tasks. Use `status <run-id>` to read all notes. Paste the `notes` text returned by `begin` into the brief for each turn. It contains the latest notes first and marks truncation at 4 KiB.
+
 ```text
 Run: <run ID>
 Task: <task ID>
@@ -103,6 +105,7 @@ Dispatch: <dispatch ID>
 Turn: <turn number>
 Worktree and branch: <absolute worktree path and branch>
 Goal: <deliverable>
+Run notes: <notes from begin>
 Edit only: <paths>
 Verify: <exact commands, one per shell call, and expected evidence>
 Diff: <exact read-only Git commands for the editable paths>

@@ -15,9 +15,11 @@ import sys
 import time
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+RUN_NOTES_LIMIT = 4096
+RUN_NOTES_TRUNCATED = b"\n[Run notes truncated]"
 ACTIVE_WORKERS = ("claude", "codex")
-# Keep agy in schema v4 for historical records; ACTIVE_WORKERS governs new work.
+# Keep agy for historical records; ACTIVE_WORKERS governs new work.
 TASKS_SCHEMA = """CREATE TABLE {} (
     id INTEGER PRIMARY KEY,
     run_id INTEGER NOT NULL REFERENCES runs(id),
@@ -115,6 +117,17 @@ CREATE TABLE events (
 );
 CREATE INDEX events_run ON events(run_id, id);
 """
+V5_SCHEMA = """
+ALTER TABLE runs ADD COLUMN notes_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE dispatches ADD COLUMN notes_version INTEGER;
+CREATE TABLE run_notes (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX run_notes_run ON run_notes(run_id, id);
+"""
 
 
 class StateError(Exception):
@@ -169,12 +182,12 @@ def migrate_v3(db, repo_common_dir):
     try:
         with transaction(db):
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (3, SCHEMA_VERSION):
+            if version not in (3, 4, SCHEMA_VERSION):
                 raise StateError(f"database schema version {version} does not match {SCHEMA_VERSION}; "
                                  "keep the existing DB and run init with a new --db path")
             if repository_common_dir(db) != str(repo_common_dir):
                 raise StateError("database belongs to a different repository")
-            if version == SCHEMA_VERSION:
+            if version != 3:
                 return
             schema_objects = db.execute(
                 "SELECT sql FROM sqlite_master WHERE tbl_name='tasks' "
@@ -218,32 +231,36 @@ def connect(path, repo_common_dir=None):
             if version == 0 and create:
                 if db.execute("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").fetchone():
                     raise StateError("refusing to initialize an existing database with unknown objects")
-            elif version == 3 and not create:
-                raise StateError(f"database schema version 3 at {path}; run init with --db pointing "
+            elif version in (3, 4) and not create:
+                raise StateError(f"database schema version {version} at {path}; run init with --db pointing "
                                  "to this file to upgrade")
-            elif version not in (3, SCHEMA_VERSION):
+            elif version not in (3, 4, SCHEMA_VERSION):
                 raise StateError(f"database schema version {version} does not match {SCHEMA_VERSION}; "
                                  "keep the existing DB and run init with a new --db path")
             elif create and repository_common_dir(db) != str(repo_common_dir):
                 raise StateError("database belongs to a different repository")
         if version == 3:
             migrate_v3(db, repo_common_dir)
-            return db
         if create:
             if db.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
                 if db.execute("PRAGMA journal_mode=WAL").fetchone()[0] != "wal":
                     raise StateError("could not enable SQLite WAL mode")
             with transaction(db):
                 version = db.execute("PRAGMA user_version").fetchone()[0]
+                if version in (4, SCHEMA_VERSION) and repository_common_dir(db) != str(repo_common_dir):
+                    raise StateError("database belongs to a different repository")
                 if version == 0:
                     for statement in SCHEMA.split(";"):
                         if statement.strip():
                             db.execute(statement)
                     db.execute("INSERT INTO repository(id, common_dir) VALUES (1, ?)", (str(repo_common_dir),))
+                    version = 4
+                if version == 4:
+                    for statement in V5_SCHEMA.split(";"):
+                        if statement.strip():
+                            db.execute(statement)
                     db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                     version = SCHEMA_VERSION
-                elif version == SCHEMA_VERSION and repository_common_dir(db) != str(repo_common_dir):
-                    raise StateError("database belongs to a different repository")
         if version != SCHEMA_VERSION:
             raise StateError(f"database schema version {version} does not match {SCHEMA_VERSION}")
     except BaseException:
@@ -321,6 +338,31 @@ def create_run(db, args):
                         (args.goal, args.slots, args.base)).lastrowid
     event(db, run_id, "run-created", {"goal": args.goal, "slots": args.slots, "base": args.base})
     return dict(run_row(db, run_id))
+
+
+def add_note(db, args):
+    version = run_row(db, args.run)["notes_version"] + 1
+    created_at = timestamp()
+    note_id = db.execute(
+        "INSERT INTO run_notes(run_id, text, created_at) VALUES (?, ?, ?)",
+        (args.run, args.text, created_at),
+    ).lastrowid
+    db.execute("UPDATE runs SET notes_version = ? WHERE id = ?", (version, args.run))
+    return {"id": note_id, "run_id": args.run, "text": args.text, "created_at": created_at,
+            "notes_version": version}
+
+
+def brief_notes(db, run_id):
+    content = bytearray()
+    notes = db.execute("SELECT text FROM run_notes WHERE run_id = ? ORDER BY id DESC", (run_id,))
+    for (note_text,) in notes:
+        if content:
+            content.extend(b"\n\n")
+        content.extend(note_text[:RUN_NOTES_LIMIT + 1].encode("utf-8"))
+        if len(content) > RUN_NOTES_LIMIT:
+            del content[RUN_NOTES_LIMIT - len(RUN_NOTES_TRUNCATED):]
+            return content.decode("utf-8", errors="ignore").rstrip() + RUN_NOTES_TRUNCATED.decode("ascii")
+    return content.decode("utf-8")
 
 
 def check_active_worker(worker):
@@ -576,14 +618,17 @@ def begin(db, args):
                        (dispatch["task_id"],))
         elif phase != "reserved":
             raise StateError("begin requires a reservation or a confirmed exit before resuming")
+        notes_version = run_row(db, dispatch["run_id"])["notes_version"]
         db.execute(
             """UPDATE dispatches SET phase = 'running', turn = turn + 1, runtime = NULL,
             heartbeat_at = ?, turn_ended_at = NULL, exited_at = NULL, exit_code = NULL,
-            outcome = NULL, evidence = NULL, delivered = 0 WHERE id = ?""",
-            (timestamp(), args.dispatch),
+            outcome = NULL, evidence = NULL, delivered = 0, notes_version = ? WHERE id = ?""",
+            (timestamp(), notes_version, args.dispatch),
         )
-        dispatch_event(db, dispatch_row(db, args.dispatch), "turn-begun")
-        return brief(db, args.dispatch)
+        dispatch_event(db, dispatch_row(db, args.dispatch), "turn-begun", notes_version=notes_version)
+        result = brief(db, args.dispatch)
+        result["notes"] = brief_notes(db, dispatch["run_id"])
+        return result
 
 
 def save_worktree(db, dispatch, worktree, branch):
@@ -911,6 +956,9 @@ def status(db, args):
             """SELECT m.* FROM messages m JOIN dispatches d ON d.id = m.dispatch_id
             JOIN tasks t ON t.id = d.task_id WHERE t.run_id = ? ORDER BY m.id""", (args.run,)
         )]
+        result["notes"] = [dict(row) for row in db.execute(
+            "SELECT * FROM run_notes WHERE run_id = ? ORDER BY id", (args.run,)
+        )]
         return result
 
 
@@ -1135,6 +1183,7 @@ def parser():
     run.add_argument("--goal", type=nonempty, required=True)
     run.add_argument("--slots", type=positive_int, required=True)
     run.add_argument("--base", type=nonempty)
+    command("note", add_note, "run").add_argument("text", type=nonempty)
 
     task = command("task-create", create_task, "run")
     task.add_argument("--worker", choices=ACTIVE_WORKERS, required=True)

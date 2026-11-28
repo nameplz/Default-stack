@@ -138,15 +138,18 @@ class TeamUpTest(unittest.TestCase):
         self.invoke("init")
         return self.invoke("run-create", "--goal", "Run goal", "--slots", slots, *options)["id"]
 
-    def create_v3(self):
+    def create_legacy_db(self, version):
         repo_common_dir = subprocess.check_output(
             ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
             cwd=self.cwd, text=True,
         ).strip()
         with sqlite3.connect(self.db) as db:
-            db.executescript(V3_SCHEMA)
+            schema = V3_SCHEMA
+            if version == 4:
+                schema = schema.replace("('claude', 'codex')", "('claude', 'codex', 'agy')")
+            db.executescript(schema)
+            db.execute(f"PRAGMA user_version={version}")
             db.executescript("""
-                PRAGMA user_version=3;
                 PRAGMA foreign_keys=ON;
                 INSERT INTO runs VALUES (7, 'Run goal', 2, 'main', 3);
                 INSERT INTO tasks VALUES
@@ -160,6 +163,8 @@ class TeamUpTest(unittest.TestCase):
                 INSERT INTO messages VALUES (31, 29, 2, 'question', 'Proceed?', 'Yes', 1);
                 INSERT INTO events VALUES (37, 7, 19, 29, 'question', 'recorded', '{}');
             """)
+            if version == 4:
+                db.execute("UPDATE tasks SET worker = 'agy' WHERE id = 11")
             db.execute("INSERT INTO repository VALUES (1, ?)", (str(Path(repo_common_dir).resolve()),))
 
     def task(self, run, goal, *constraints, worker="codex"):
@@ -169,9 +174,9 @@ class TeamUpTest(unittest.TestCase):
         )["id"]
 
     def make_legacy_agy(self, task):
-        # Lifecycle state is identical in v4; restore the old worker identity after setup.
+        # Restore the historical worker identity after creating the lifecycle state.
         with closing(sqlite3.connect(self.db)) as db, db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)
             db.execute("UPDATE tasks SET worker = 'agy' WHERE id = ?", (task,))
 
     def assert_legacy_execution_rejected(self, *args, error="worker 'agy' is not supported for new work"):
@@ -232,7 +237,7 @@ class TeamUpTest(unittest.TestCase):
     def test_only_init_creates_or_changes_journal(self):
         self.invoke("run-create", "--goal", "Run", "--slots", 1, expected=1)
         self.assertFalse(self.db.exists())
-        self.assertEqual(self.invoke("init")["schema_version"], 4)
+        self.assertEqual(self.invoke("init")["schema_version"], 5)
         with sqlite3.connect(self.db) as db:
             self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
             self.assertEqual(db.execute("PRAGMA journal_mode=DELETE").fetchone()[0], "delete")
@@ -357,16 +362,35 @@ class TeamUpTest(unittest.TestCase):
         self.invoke("gate", run, "rollout", "--decision", "reject", expected=1)
 
     def test_init_upgrades_v3_and_preserves_data_and_foreign_keys(self):
-        self.create_v3()
+        self.assert_init_upgrades_legacy_db(3)
+
+    def test_init_upgrades_v4_and_preserves_data_and_foreign_keys(self):
+        self.assert_init_upgrades_legacy_db(4)
+
+    def assert_init_upgrades_legacy_db(self, version):
+        self.create_legacy_db(version)
+        denied = self.invoke("status", 7, expected=1)
+        self.assertIn("run init with --db pointing", denied.stderr)
         with sqlite3.connect(self.db) as db:
             original_rows = [line for line in db.iterdump() if line.startswith("INSERT INTO ")]
+        upgraded_rows = []
+        for line in original_rows:
+            if line.startswith('INSERT INTO "runs"'):
+                line = line[:-2] + ",0);"
+            elif line.startswith('INSERT INTO "dispatches"'):
+                line = line[:-2] + ",NULL);"
+            upgraded_rows.append(line)
 
-        self.assertEqual(self.invoke("init")["schema_version"], 4)
+        self.assertEqual(self.invoke("init")["schema_version"], 5)
+        status = self.invoke("status", 7)
+        self.assertEqual(status["run"]["notes_version"], 0)
+        self.assertEqual(status["notes"], [])
+        self.assertIsNone(status["dispatches"][0]["notes_version"])
         with sqlite3.connect(self.db) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
             self.assertIn("tasks_run", [row[1] for row in db.execute("PRAGMA index_list(tasks)")])
-            self.assertEqual([line for line in db.iterdump() if line.startswith("INSERT INTO ")], original_rows)
+            self.assertEqual([line for line in db.iterdump() if line.startswith("INSERT INTO ")], upgraded_rows)
             with self.assertRaises(sqlite3.IntegrityError):
                 db.execute("UPDATE tasks SET worker = 'unknown' WHERE id = 19")
 
@@ -376,9 +400,75 @@ class TeamUpTest(unittest.TestCase):
             expected=2,
         )
         self.assertIn("invalid choice: 'agy'", result.stderr)
-        self.assertEqual(self.invoke("init")["schema_version"], 4)
+        self.assertEqual(self.invoke("init")["schema_version"], 5)
         with sqlite3.connect(self.db) as db:
-            self.assertEqual([line for line in db.iterdump() if line.startswith("INSERT INTO ")], original_rows)
+            self.assertEqual([line for line in db.iterdump() if line.startswith("INSERT INTO ")], upgraded_rows)
+        self.assertEqual(self.invoke("note", 7, "Use the existing checklist")["notes_version"], 1)
+
+    def test_note_appends_to_its_run_and_status_lists_notes_in_order(self):
+        run = self.run_create()
+        other = self.run_create()
+        self.invoke("note", run, "  ", expected=2)
+        self.invoke("note", 999, "Unknown run", expected=1)
+        first = self.invoke("note", run, "Use the system Python")
+        self.invoke("note", other, "Separate run")
+        second = self.invoke("note", run, "Keep notes short\nInclude commands")
+
+        self.assertEqual((first.pop("notes_version"), second.pop("notes_version")), (1, 2))
+        self.assertEqual(first["run_id"], run)
+        self.assertTrue(first["created_at"])
+        self.assertLess(first["id"], second["id"])
+        status = self.invoke("status", run)
+        self.assertEqual(status["run"]["notes_version"], 2)
+        self.assertEqual(status["notes"], [first, second])
+        self.assertEqual([note["text"] for note in status["notes"]],
+                         ["Use the system Python", "Keep notes short\nInclude commands"])
+        self.assertEqual(self.invoke("status", other)["run"]["notes_version"], 1)
+
+    def test_begin_snapshots_notes_per_turn(self):
+        worktree = self.linked_worktree()
+        run = self.run_create()
+        task = self.task(run, "Implement")
+        dispatch = self.invoke("reserve", run, "--task", task,
+                               "--worktree", worktree, "--branch", "assigned")["id"]
+        self.invoke("note", run, "First decision")
+        first = self.invoke("begin", dispatch)
+        self.assertEqual((first["notes_version"], first["notes"]), (1, "First decision"))
+        self.started(dispatch, first["turn"])
+        question = self.invoke("record", dispatch, "--turn", first["turn"], "Which path?")["id"]
+        self.invoke("answer", question, "Use path A")
+        self.exit_worker(dispatch, first["turn"])
+        self.invoke("note", run, "Newest decision")
+
+        status = self.invoke("status", run)
+        self.assertEqual(status["run"]["notes_version"], 2)
+        self.assertEqual(status["dispatches"][0]["notes_version"], 1)
+        second = self.invoke("begin", dispatch)
+        self.assertEqual((second["notes_version"], second["notes"]),
+                         (2, "Newest decision\n\nFirst decision"))
+        with closing(sqlite3.connect(self.db)) as db:
+            events = db.execute(
+                "SELECT data FROM events WHERE dispatch_id = ? AND kind = 'turn-begun' ORDER BY id",
+                (dispatch,),
+            ).fetchall()
+        self.assertEqual([json.loads(data) for (data,) in events],
+                         [{"turn": 1, "notes_version": 1}, {"turn": 2, "notes_version": 2}])
+
+    def test_begin_caps_note_text_in_utf8_bytes(self):
+        run = self.run_create()
+        task = self.task(run, "Use notes in the brief")
+        dispatch = self.invoke("reserve", run, "--task", task)["id"]
+        older = "Older note"
+        newest = "🍋" * 1500
+        self.invoke("note", run, older)
+        self.invoke("note", run, newest)
+
+        brief = self.invoke("begin", dispatch)
+        marker = "\n[Run notes truncated]"
+        self.assertEqual(brief["notes_version"], 2)
+        self.assertEqual(brief["notes"], newest[:(4096 - len(marker)) // 4] + marker)
+        self.assertLessEqual(len(brief["notes"].encode("utf-8")), 4096)
+        self.assertEqual([note["text"] for note in self.invoke("status", run)["notes"]], [older, newest])
 
     def test_active_workers_run_while_legacy_agy_reservations_are_blocked(self):
         run = self.run_create(slots=1)
@@ -520,7 +610,7 @@ class TeamUpTest(unittest.TestCase):
                 self.assertEqual(self.invoke("reserve", run)["task_id"], next_task)
 
     def test_non_init_on_v3_suggests_init_on_the_same_database(self):
-        self.create_v3()
+        self.create_legacy_db(3)
         result = self.invoke("status", 7, expected=1)
         self.assertIn("schema version 3", result.stderr)
         self.assertIn("run init", result.stderr)
@@ -529,7 +619,7 @@ class TeamUpTest(unittest.TestCase):
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
 
     def test_init_rolls_back_v3_upgrade_when_foreign_key_check_fails(self):
-        self.create_v3()
+        self.create_legacy_db(3)
         with sqlite3.connect(self.db) as db:
             db.execute("PRAGMA foreign_keys=OFF")
             db.execute("UPDATE dispatches SET task_id = 99 WHERE id = 29")
