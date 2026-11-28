@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import fcntl
 from fnmatch import fnmatchcase
 import hashlib
+from html import escape
 import json
 import math
 import os
@@ -15,6 +16,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+from tempfile import NamedTemporaryFile
 import time
 
 
@@ -833,12 +835,15 @@ READY = f"""
 """
 
 
-def slot_available(db, run):
-    occupied = db.execute(
+def occupied_slots(db, run_id):
+    return db.execute(
         """SELECT count(*) FROM dispatches d JOIN tasks t ON t.id = d.task_id
-        WHERE t.run_id = ? AND d.phase != 'closed'""", (run["id"],)
+        WHERE t.run_id = ? AND d.phase != 'closed'""", (run_id,)
     ).fetchone()[0]
-    return occupied < run["slots"]
+
+
+def slot_available(db, run):
+    return occupied_slots(db, run["id"]) < run["slots"]
 
 
 def worktree_spec(args):
@@ -1525,10 +1530,12 @@ def board_entry(task, dispatches, dependencies, dependents, gates, messages, pr,
     return "done", latest["outcome"] or "closed", {"abandon_reason": latest["abandon_reason"]}
 
 
-def board(db, args):
+def board(db, args, *, include_slots=False):
     now = datetime.now(timezone.utc)
     with transaction(db, write=False):
-        run_row(db, args.run)
+        run = run_row(db, args.run)
+        if include_slots:
+            occupied = occupied_slots(db, args.run)
         tasks = db.execute("SELECT * FROM tasks WHERE run_id = ? ORDER BY id", (args.run,)).fetchall()
         dispatches, messages, dependencies, dependents, gates = {}, {}, {}, {}, {}
         for row in db.execute(
@@ -1580,10 +1587,13 @@ def board(db, args):
             "task_id": task["id"], "worker": task["worker"], "goal": short_goal(task["goal"]),
             "dispatch_id": latest["id"] if latest else None, "fact": fact, **details,
         })
-    return {"run_id": args.run, "groups": [
+    result = {"run_id": args.run, "groups": [
         {"key": key, "title": title, "count": len(groups[key]), "tasks": groups[key]}
         for key, title in BOARD_GROUPS
     ]}
+    if include_slots:
+        result.update(occupied=occupied, slots=run["slots"])
+    return result
 
 
 def render_board(result):
@@ -1609,6 +1619,123 @@ def render_board(result):
                 facts.append(task["last_update_at"])
             lines.append(f"  #{task['task_id']} {task['worker']} {task['goal']}  " + " · ".join(facts))
     return "\n".join(lines)
+
+
+BOARD_CSS = """
+:root {
+  color-scheme: light dark;
+  --bg: #f4f5f7; --card: #fff; --text: #17202d; --muted: #4b5868;
+  --line: #d5dbe3; --accent: #235bbd; --focus: #edf4ff; --stall: #a03917;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #141922; --card: #1d2531; --text: #e9eef6; --muted: #b3bfce;
+    --line: #3c4859; --accent: #8db7ff; --focus: #202f48; --stall: #ffad8a;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  max-width: 76rem; margin: 0 auto; padding: clamp(1rem, 4vw, 2.5rem);
+  background: var(--bg); color: var(--text);
+  font: 1rem/1.45 system-ui, sans-serif; overflow-wrap: anywhere;
+}
+header, h2, .task-meta, .stats {
+  display: flex; align-items: baseline; flex-wrap: wrap; gap: .35rem .65rem;
+}
+header { justify-content: space-between; border-bottom: 1px solid var(--line); padding-bottom: 1rem; }
+h1, h2, p { margin: 0; }
+h1 { font-size: 1.5rem; }
+main { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 19rem), 1fr)); gap: 1rem; }
+section { min-width: 0; }
+h2 { font-size: 1rem; padding: 1rem 0 .5rem; }
+article {
+  margin-bottom: .5rem; padding: .75rem; border: 1px solid var(--line);
+  border-radius: .5rem; background: var(--card);
+}
+article p { margin-top: .3rem; }
+.needs_user article { border-inline-start: .25rem solid var(--accent); background: var(--focus); }
+article.stalled { border-color: var(--stall); }
+.stall { color: var(--stall); font-weight: 600; }
+.count, .task-meta, .stats, .fact { color: var(--muted); font-variant-numeric: tabular-nums; }
+.task-meta, .stats, .fact { font-size: .875rem; }
+.goal { font-weight: 600; }
+.track { height: .3rem; margin-top: .55rem; border-radius: 1rem; background: var(--line); overflow: hidden; }
+.track span { display: block; height: 100%; background: var(--accent); }
+.stalled .track span { background: var(--stall); }
+"""
+
+
+def render_board_card(task, running):
+    stalled = running and task["stalled"]
+    markup = [
+        '<article class="stalled">' if stalled else '<article>',
+        f'<div class="task-meta"><strong>#{task["task_id"]}</strong> {escape(task["worker"])}</div>',
+        f'<p class="goal">{escape(task["goal"])}</p>',
+        f'<p class="fact">{escape(task["fact"])}</p>',
+    ]
+    if running:
+        stats = []
+        step, total = task["progress_step"], task["progress_total"]
+        if step is not None:
+            markup.append(f'<div class="track" aria-hidden="true"><span style="width: {100 * step / total:g}%"></span></div>')
+            stats.append(f"<span>{step}/{total}</span>")
+        if task["progress_text"]:
+            markup.append(f'<p>{escape(task["progress_text"])}</p>')
+        diff = task["diff_stats"]
+        if diff is not None:
+            stats.append(f'<span>{diff["files"]}개 파일</span><span>+{diff["added"]} −{diff["deleted"]}</span>')
+        if task["last_update_at"]:
+            updated = datetime.fromisoformat(task["last_update_at"]).astimezone()
+            stats.append(f'<time>{updated:%H:%M:%S}</time>')
+        if stalled:
+            stats.append('<span class="stall">정체</span>')
+        if stats:
+            markup.append('<p class="stats">' + "".join(stats) + "</p>")
+    markup.append("</article>")
+    return "\n".join(markup)
+
+
+def render_board_html(result, refresh):
+    markup = [
+        '<!doctype html>', '<html lang="ko">', '<head>', '<meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        f'<meta http-equiv="refresh" content="{refresh}">',
+        f'<title>Run #{result["run_id"]}</title>',
+        f'<style>{BOARD_CSS}</style>', '</head>', '<body>',
+        f'<header><h1>Run #{result["run_id"]}</h1>'
+        f'<span class="count">{result["occupied"]}/{result["slots"]}</span></header>',
+        '<main>',
+    ]
+    for group in result["groups"]:
+        markup.append(f'<section class="{escape(group["key"])}">')
+        markup.append(f'<h2>{escape(group["title"])} <span class="count">{group["count"]}</span></h2>')
+        for task in group["tasks"]:
+            running = group["key"] == "in_progress" and task.get("phase") == "running"
+            markup.append(render_board_card(task, running))
+        markup.append("</section>")
+    return "\n".join([*markup, "</main>", "</body>", "</html>", ""])
+
+
+def write_board_html(path, markup):
+    temp = None
+    try:
+        with NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as file:
+            temp = Path(file.name)
+            file.write(markup)
+        os.replace(temp, path)
+    finally:
+        if temp is not None:
+            temp.unlink(missing_ok=True)
+
+
+def board_html(db, args):
+    path = args.html.expanduser().absolute()
+    while True:
+        result = board(db, args, include_slots=True)
+        write_board_html(path, render_board_html(result, args.watch or 5))
+        if args.watch is None:
+            return {"path": str(path)}
+        time.sleep(args.watch)
 
 
 def flag_dispatch(db, args):
@@ -1785,7 +1912,11 @@ def parser():
     wait_command.add_argument("--sync-prs", type=positive_int, metavar="SECONDS")
     command("ack", ack, "run").add_argument("event", type=nonnegative_int)
     command("status", status, "run", writes=False)
-    command("board", board, "run", writes=False).add_argument("--json", action="store_true")
+    board_command = command("board", board, "run", writes=False)
+    board_format = board_command.add_mutually_exclusive_group()
+    board_format.add_argument("--json", action="store_true")
+    board_format.add_argument("--html", type=Path, metavar="PATH")
+    board_command.add_argument("--watch", type=positive_int, metavar="SECONDS")
     for name in ("keep-open", "takeover", "delivered"):
         command(name, flag_dispatch, "dispatch")
     command("cleanup", cleanup, "run", writes=False)
@@ -1793,7 +1924,12 @@ def parser():
 
 
 def main(argv=None):
-    args = parser().parse_args(argv)
+    cli = parser()
+    args = cli.parse_args(argv)
+    html_board = args.command == "board" and args.html is not None
+    watching_board = args.command == "board" and args.watch is not None
+    if watching_board and not html_board:
+        cli.error("--watch requires --html")
     try:
         repo_common_dir = common_dir() if args.command == "init" else None
         path = database_path(args, repo_common_dir)
@@ -1805,6 +1941,8 @@ def main(argv=None):
             elif args.command in ("pr-open", "pr-policy", "pr-arm"):
                 with pr_command_lock(db):
                     result = args.handler(db, args)
+            elif html_board:
+                result = board_html(db, args)
             elif args.writes:
                 with transaction(db):
                     result = args.handler(db, args)
@@ -1815,7 +1953,7 @@ def main(argv=None):
                 if warning:
                     result["warning"] = warning
     except KeyboardInterrupt:
-        return 130
+        return 0 if watching_board else 130
     except (StateError, sqlite3.Error, OSError, OverflowError) as exc:
         print(f"team-up: {exc}", file=sys.stderr)
         return 1
@@ -1823,7 +1961,7 @@ def main(argv=None):
             and not getattr(args, "start_failed", False)):
         print(f"team-up: warning: Dispatch {args.dispatch} turn {args.turn} "
               "has no runtime handle recorded with started", file=sys.stderr)
-    if args.command == "board" and not args.json:
+    if args.command == "board" and not args.json and not html_board:
         print(render_board(result))
         return 0
     print(json.dumps(result, ensure_ascii=False))

@@ -301,6 +301,8 @@ Running Dispatches show their reported step and text, worktree diff stats, last 
 
 Running entries in `board --json` include `progress_text`, `progress_step`, `progress_total`, and `progress_at`. Unreported values are `null`. `last_update_at` is the latest heartbeat or progress timestamp in UTC, and `stalled` is a boolean. `diff_stats` contains `files`, `added`, and `deleted`, or is `null` when the worktree is unavailable.
 
+Run `board <run-id> --html <path> [--watch <seconds>]` and open the file in the app's browser pane. Use a positive whole number with `--watch` to keep the board current. Press Ctrl+C to stop. Omit `--watch` to write the file once.
+
 ## Stop or retry
 
 - Treat an overdue heartbeat as a prompt to inspect the saved handle and start identity. Check the host or supervisor for current liveness. Keep the slot and worktree reserved while liveness is unknown.

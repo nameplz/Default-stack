@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import runpy
 import sqlite3
 import subprocess
 import sys
@@ -11,6 +12,7 @@ from tempfile import TemporaryDirectory
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "team_up.py"
@@ -1385,6 +1387,7 @@ class TeamUpTest(unittest.TestCase):
         board = self.invoke("board", run, "--json")
         with sqlite3.connect(self.db) as db:
             self.assertEqual(list(db.iterdump()), before)
+        self.assertEqual(set(board), {"run_id", "groups"})
         groups = {group["key"]: {task["task_id"]: task["fact"] for task in group["tasks"]}
                   for group in board["groups"]}
         self.assertEqual([group["key"] for group in board["groups"]],
@@ -1407,6 +1410,16 @@ class TeamUpTest(unittest.TestCase):
         self.assertEqual(groups["done"], {ids["abandoned"]: "abandoned", ids["delivered"]: "전달됨"})
         listed = [task for group in groups.values() for task in group]
         self.assertEqual(sorted(listed), sorted(ids.values()))
+        path = self.db.parent / "board.html"
+        self.invoke("board", run, "--html", path)
+        html = path.read_text(encoding="utf-8")
+        headings = [f'<h2>{title} <span class="count">{count}</span></h2>'
+                    for title, count in (("내 차례", 3), ("진행 중", 2), ("검토 대기", 1),
+                                         ("머지 중", 1), ("막힘", 3), ("완료", 2))]
+        positions = [html.index(heading) for heading in headings]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn('<span class="count">2/20</span>', html)
+        self.assertIn(f"← #{ids['merging']} 머지", html)
 
     def test_board_text_lists_nonempty_groups_with_counts(self):
         run = self.run_create()
@@ -1416,6 +1429,57 @@ class TeamUpTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, f"진행 중 (1)\n  #{queued} codex First line goal  대기열\n")
         self.invoke("board", 99, expected=1)
+
+    def test_board_html_replaces_the_target_and_escapes_the_goal(self):
+        run = self.run_create()
+        self.task(run, '<script>"a"&\'b\'</script>')
+        directory = self.db.parent / "output with spaces"
+        directory.mkdir()
+        path = directory / "board.html"
+        path.write_text("previous board", encoding="utf-8")
+        with path.open(encoding="utf-8") as previous:
+            self.assertEqual(self.invoke("board", run, "--html", path), {"path": str(path)})
+            self.assertEqual(previous.read(), "previous board")
+        self.assertEqual(list(directory.iterdir()), [path])
+        html = path.read_text(encoding="utf-8")
+        self.assertIn("&lt;script&gt;&quot;a&quot;&amp;&#x27;b&#x27;&lt;/script&gt;", html)
+        self.assertNotIn("<script", html)
+        self.assertIn(f"<h1>Run #{run}</h1>", html)
+        self.assertIn('<meta http-equiv="refresh" content="5">', html)
+        self.assertIn('<h2>완료 <span class="count">0</span></h2>\n</section>', html)
+
+    def test_board_watch_requires_html_and_a_positive_interval(self):
+        path = self.db.parent / "board.html"
+        for flags in (("--watch", "1"), ("--json", "--watch", "1"),
+                      ("--json", "--html", path), ("--html", path, "--watch", "0"),
+                      ("--html", path, "--watch", "-1")):
+            with self.subTest(flags=flags):
+                self.invoke("board", 1, *flags, expected=2)
+        self.assertFalse(path.exists())
+
+    def test_board_watch_reads_fresh_state_and_stops_on_interrupt(self):
+        run = self.run_create()
+        path = self.db.parent / "board.html"
+        main = runpy.run_path(str(SCRIPT))["main"]
+        snapshots = []
+
+        def sleep(seconds):
+            self.assertEqual(seconds, 3)
+            snapshots.append(path.read_text(encoding="utf-8"))
+            if len(snapshots) == 2:
+                raise KeyboardInterrupt
+            self.task(run, "Arrived during the wait")
+            with closing(sqlite3.connect(self.db, timeout=0)) as db:
+                self.assertEqual(db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0], 0)
+
+        with patch("time.sleep", side_effect=sleep):
+            code = main(["--db", str(self.db), "board", str(run), "--html", str(path), "--watch", "3"])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(snapshots), 2)
+        self.assertNotIn("Arrived during the wait", snapshots[0])
+        self.assertIn("Arrived during the wait", snapshots[1])
+        for html in snapshots:
+            self.assertIn('<meta http-equiv="refresh" content="3">', html)
 
     def test_board_shows_running_progress_and_worktree_diff_stats(self):
         worktree = self.linked_worktree()
@@ -1446,6 +1510,14 @@ class TeamUpTest(unittest.TestCase):
         result = subprocess.run([*self.command, "board", str(run)], cwd=self.cwd,
                                 capture_output=True, text=True, timeout=30, check=True)
         self.assertIn(f"2/3 단계 · Check results · 4개 파일 +4 -1 · {report['progress_at']}", result.stdout)
+        path = self.db.parent / "board.html"
+        self.invoke("progress", dispatch, "--turn", turn, "--step", "2/4", "Check <results>")
+        self.invoke("board", run, "--html", path)
+        html = path.read_text(encoding="utf-8")
+        self.assertIn('<span style="width: 50%"></span>', html)
+        self.assertIn("<span>2/4</span>", html)
+        self.assertIn("Check &lt;results&gt;", html)
+        self.assertIn("<span>4개 파일</span><span>+4 −1</span>", html)
         worktree.rename(worktree.with_name("moved worktree"))
         self.assertIsNone(card()["diff_stats"])
         worktree.mkdir()
@@ -1477,6 +1549,12 @@ class TeamUpTest(unittest.TestCase):
         result = subprocess.run([*self.command, "board", str(run)], cwd=self.cwd,
                                 capture_output=True, text=True, timeout=30, check=True)
         self.assertIn("⚠ 정체 · Waiting for tests", result.stdout)
+        path = self.db.parent / "board.html"
+        self.invoke("board", run, "--html", path)
+        html = path.read_text(encoding="utf-8")
+        updated = datetime.fromisoformat(old).astimezone()
+        self.assertIn(f"<time>{updated:%H:%M:%S}</time>", html)
+        self.assertIn('<article class="stalled">', html)
 
     def test_wait_cursor_preserves_actionable_events_beyond_a_full_batch(self):
         run = self.run_create()
