@@ -114,6 +114,7 @@ Python: <selected executable>
 Script: <absolute script path used in the commands>
 
 Run each supplied command in its own shell call from the assigned worktree.
+Report the step count once you have a plan. Send one progress line whenever the step changes.
 Keep the command prefix exactly as supplied. If a required tool call is denied,
 record a question naming the denied tool and path or command. Record any blocking
 question once and end the turn.
@@ -132,10 +133,13 @@ Use the following commands as examples for the brief. Replace the evidence JSON 
 
 ```sh
 /opt/python/bin/python3 /opt/team-up/team_up.py --db /var/tmp/team-up/state.db heartbeat 12 --turn 1
+/opt/python/bin/python3 /opt/team-up/team_up.py --db /var/tmp/team-up/state.db progress 12 --turn 1 --step 1/3 'Inspect the existing migration'
 /opt/python/bin/python3 /opt/team-up/team_up.py --db /var/tmp/team-up/state.db record 12 --turn 1 'Which path should I use?'
 /opt/python/bin/python3 /opt/team-up/team_up.py --db /var/tmp/team-up/state.db done 12 --turn 1 --evidence '{"status":"success","result":"Full result with test output","verification":[{"command":"/usr/bin/python3 -m unittest","exit_code":0,"location":"completion report result"}],"changed_code":true,"diff":"<Git patch output encoded as a JSON string>"}'
 /opt/python/bin/python3 /opt/team-up/team_up.py --db /var/tmp/team-up/state.db done 12 --turn 1 --evidence-file /var/tmp/team-up/evidence-12-t1.json
 ```
+
+Use `progress <dispatch-id> --turn N [--step k/n] <text>` during the active running turn. Use `1 <= k <= n` and at most 200 characters of text. Omit `--step` to keep the reported step and total. Each report refreshes the heartbeat and records a `progress` event. `wait` continues waiting for an actionable event or its timeout. `begin` clears the prior turn's progress.
 
 Use one terminal path per turn. A worker that records a blocking question ends the turn instead of running `done`. Preserve the worker log and Git patch before cleanup.
 
@@ -292,6 +296,10 @@ GitHub can merge an armed PR between polls. If other actors can push to an armed
 ## Report progress with the board
 
 When you report progress to the user, run `board <run-id>` and show its output as is. It is read-only and places each Task in one group: 내 차례 (unanswered questions, undecided gates, three start failures), 진행 중 (open Dispatches and ready Tasks marked 대기열), 검토 대기, 머지 중, 막힘 (with `←` naming what the Task waits on), and 완료. Lead with the 내 차례 items. Use `board <run-id> --json` when you need the same groups as data, and `status` when you need the raw records.
+
+Running Dispatches show their reported step and text, worktree diff stats, last update time, and a stall marker after 10 minutes without a heartbeat or progress report. The coordinator counts changes against `HEAD` and includes untracked files. Binary files contribute zero lines.
+
+Running entries in `board --json` include `progress_text`, `progress_step`, `progress_total`, and `progress_at`. Unreported values are `null`. `last_update_at` is the latest heartbeat or progress timestamp in UTC, and `stalled` is a boolean. `diff_stats` contains `files`, `added`, and `deleted`, or is `null` when the worktree is unavailable.
 
 ## Stop or retry
 

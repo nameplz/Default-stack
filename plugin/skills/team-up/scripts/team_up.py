@@ -11,6 +11,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 import sys
@@ -20,6 +21,8 @@ import time
 SCHEMA_VERSION = 5
 RUN_NOTES_LIMIT = 4096
 RUN_NOTES_TRUNCATED = b"\n[Run notes truncated]"
+PROGRESS_TEXT_LIMIT = 200
+STALL_SECONDS = 600
 ACTIVE_WORKERS = ("claude", "codex")
 PR_POLICIES = ("auto", "hold", "manual")
 PR_FIX_LIMIT = 3
@@ -128,6 +131,10 @@ CREATE INDEX events_run ON events(run_id, id);
 V5_SCHEMA = """
 ALTER TABLE runs ADD COLUMN notes_version INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE dispatches ADD COLUMN notes_version INTEGER;
+ALTER TABLE dispatches ADD COLUMN progress_text TEXT;
+ALTER TABLE dispatches ADD COLUMN progress_step INTEGER;
+ALTER TABLE dispatches ADD COLUMN progress_total INTEGER;
+ALTER TABLE dispatches ADD COLUMN progress_at TEXT;
 CREATE TABLE run_notes (
     id INTEGER PRIMARY KEY,
     run_id INTEGER NOT NULL REFERENCES runs(id),
@@ -170,13 +177,13 @@ def timestamp():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
-def git(*args, directory=None):
+def git(*args, directory=None, nul=False):
     result = subprocess.run(
-        ["git", *args], cwd=directory, text=True, capture_output=True, check=False
+        ["git", *args], cwd=directory, text=not nul, capture_output=True, check=False
     )
     if result.returncode:
-        raise StateError(result.stderr.strip() or f"git {args[0]} failed ({result.returncode})")
-    return result.stdout.rstrip("\n")
+        raise StateError(os.fsdecode(result.stderr).strip() or f"git {args[0]} failed ({result.returncode})")
+    return os.fsdecode(result.stdout) if nul else result.stdout.rstrip("\n")
 
 
 def common_dir(directory=None):
@@ -1006,6 +1013,7 @@ def begin(db, args):
         db.execute(
             """UPDATE dispatches SET phase = 'running', turn = turn + 1, runtime = NULL,
             heartbeat_at = ?, turn_ended_at = NULL, exited_at = NULL, exit_code = NULL,
+            progress_text = NULL, progress_step = NULL, progress_total = NULL, progress_at = NULL,
             outcome = NULL, evidence = NULL, delivered = 0, notes_version = ? WHERE id = ?""",
             (timestamp(), notes_version, args.dispatch),
         )
@@ -1165,6 +1173,25 @@ def heartbeat(db, args):
     db.execute("UPDATE dispatches SET heartbeat_at = ? WHERE id = ?", (now, args.dispatch))
     dispatch_event(db, dispatch, "heartbeat", heartbeat_at=now)
     return {"dispatch_id": args.dispatch, "turn": args.turn, "heartbeat_at": now}
+
+
+def progress(db, args):
+    dispatch = current_turn(db, args)
+    if dispatch["phase"] != "running":
+        raise StateError("progress requires a running turn")
+    if len(args.text) > PROGRESS_TEXT_LIMIT:
+        raise StateError(f"progress text must be at most {PROGRESS_TEXT_LIMIT} characters")
+    step, total = args.step or (dispatch["progress_step"], dispatch["progress_total"])
+    now = timestamp()
+    db.execute(
+        """UPDATE dispatches SET progress_text = ?, progress_step = ?, progress_total = ?,
+        progress_at = ?, heartbeat_at = ? WHERE id = ?""",
+        (args.text, step, total, now, now, args.dispatch),
+    )
+    report = {"progress_text": args.text, "progress_step": step, "progress_total": total,
+              "progress_at": now, "heartbeat_at": now}
+    dispatch_event(db, dispatch, "progress", **report)
+    return {"dispatch_id": args.dispatch, "turn": args.turn, **report}
 
 
 def record_question(db, args):
@@ -1386,6 +1413,57 @@ def short_goal(goal, limit=48):
     return line if len(line) <= limit else line[:limit - 1] + "…"
 
 
+def untracked_lines(path):
+    if path.is_symlink():
+        target = os.readlink(path)
+        return target.count("\n") + (not target.endswith("\n"))
+    if not path.is_file():
+        return 0
+    with path.open("rb") as file:
+        chunk = file.read(8000)
+        if not chunk or b"\0" in chunk:
+            return 0
+        lines = 0
+        while chunk:
+            lines += chunk.count(b"\n")
+            last_byte = chunk[-1:]
+            chunk = file.read(65536)
+        return lines + (last_byte != b"\n")
+
+
+def worktree_diff_stats(worktree):
+    if not worktree:
+        return None
+    try:
+        root = Path(worktree)
+        if not (root / ".git").exists():
+            return None
+        options = {"directory": root, "nul": True}
+        diff = git("--no-optional-locks", "diff", "--numstat", "-z", "--no-ext-diff",
+                   "--no-textconv", "HEAD", "--", **options)
+        untracked = git("--no-optional-locks", "ls-files", "--others", "--exclude-standard", "-z", **options)
+        files = added = deleted = 0
+        records = iter(diff.split("\0"))
+        for record in records:
+            if not record:
+                break
+            additions, deletions, path = record.split("\t", 2)
+            if not path:  # A rename has its old and new paths in the next two fields.
+                next(records)
+                next(records)
+            files += 1
+            if additions != "-":
+                added += int(additions)
+                deleted += int(deletions)
+        for path in untracked.split("\0"):
+            if path:
+                files += 1
+                added += untracked_lines(root / path)
+    except (OSError, StateError):
+        return None
+    return {"files": files, "added": added, "deleted": deleted}
+
+
 def board_pr(pr):
     number = f"PR #{pr['number']}"
     trouble = "충돌" if pr_conflict(pr) else "실패" if pr["checks"] == "failing" else None
@@ -1485,13 +1563,22 @@ def board(db, args):
     groups = {key: [] for key, _ in BOARD_GROUPS}
     for task in tasks:
         history = dispatches.get(task["id"], [])
+        latest = history[-1] if history else None
         group, fact, details = board_entry(
             task, history, dependencies.get(task["id"], []), dependents.get(task["id"], []),
             gates.get(task["id"], []), messages, prs.get(task["id"]), now,
         )
+        if latest and latest["phase"] == "running":
+            last_update = max(filter(None, (latest["heartbeat_at"], latest["progress_at"])), default=None)
+            details.update({key: latest[key] for key in
+                            ("phase", "progress_text", "progress_step", "progress_total", "progress_at")})
+            details["last_update_at"] = last_update
+            details["stalled"] = (last_update is not None
+                                  and (now - datetime.fromisoformat(last_update)).total_seconds() > STALL_SECONDS)
+            details["diff_stats"] = worktree_diff_stats(latest["worktree"])
         groups[group].append({
             "task_id": task["id"], "worker": task["worker"], "goal": short_goal(task["goal"]),
-            "dispatch_id": history[-1]["id"] if history else None, "fact": fact, **details,
+            "dispatch_id": latest["id"] if latest else None, "fact": fact, **details,
         })
     return {"run_id": args.run, "groups": [
         {"key": key, "title": title, "count": len(groups[key]), "tasks": groups[key]}
@@ -1508,7 +1595,19 @@ def render_board(result):
             lines.append("")
         lines.append(f"{group['title']} ({group['count']})")
         for task in group["tasks"]:
-            lines.append(f"  #{task['task_id']} {task['worker']} {task['goal']}  {task['fact']}")
+            facts = [task["fact"]]
+            if task.get("stalled"):
+                facts.append("⚠ 정체")
+            if task.get("progress_step") is not None:
+                facts.append(f"{task['progress_step']}/{task['progress_total']} 단계")
+            if task.get("progress_text"):
+                facts.append("".join(char if char.isprintable() else " " for char in task["progress_text"]))
+            if task.get("diff_stats") is not None:
+                diff = task["diff_stats"]
+                facts.append(f"{diff['files']}개 파일 +{diff['added']} -{diff['deleted']}")
+            if task.get("last_update_at"):
+                facts.append(task["last_update_at"])
+            lines.append(f"  #{task['task_id']} {task['worker']} {task['goal']}  " + " · ".join(facts))
     return "\n".join(lines)
 
 
@@ -1574,6 +1673,15 @@ def positive_int(value):
     if not number:
         raise argparse.ArgumentTypeError("expected a positive integer")
     return number
+
+
+def progress_step(value):
+    match = re.fullmatch(r"([0-9]{1,19})/([0-9]{1,19})", value)
+    if match:
+        step, total = map(int, match.groups())
+        if 1 <= step <= total <= 2**63 - 1:
+            return step, total
+    raise argparse.ArgumentTypeError("expected k/n with 1 <= k <= n and both numbers fitting a 64-bit integer")
 
 
 def duration(value):
@@ -1657,6 +1765,9 @@ def parser():
     command("stop", request_stop, "dispatch")
     command("abandon", request_stop, "dispatch").add_argument("--reason", type=nonempty, required=True)
     command("heartbeat", heartbeat, "dispatch", turn=True)
+    progress_command = command("progress", progress, "dispatch", turn=True)
+    progress_command.add_argument("--step", type=progress_step, metavar="k/n")
+    progress_command.add_argument("text", type=nonempty)
 
     command("record", record_question, "dispatch", turn=True).add_argument("question", type=nonempty)
     ask_command = command("ask", ask, "dispatch", writes=False, turn=True)

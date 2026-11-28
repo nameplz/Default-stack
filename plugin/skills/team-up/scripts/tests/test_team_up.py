@@ -2,6 +2,7 @@ import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -629,7 +630,7 @@ class TeamUpTest(unittest.TestCase):
             if line.startswith('INSERT INTO "runs"'):
                 line = line[:-2] + ",0);"
             elif line.startswith('INSERT INTO "dispatches"'):
-                line = line[:-2] + ",NULL);"
+                line = line[:-2] + ",NULL,NULL,NULL,NULL,NULL);"
             upgraded_rows.append(line)
 
         self.assertEqual(self.invoke("init")["schema_version"], 5)
@@ -638,6 +639,8 @@ class TeamUpTest(unittest.TestCase):
         self.assertEqual(status["notes"], [])
         self.assertEqual(status["pull_requests"], [])
         self.assertIsNone(status["dispatches"][0]["notes_version"])
+        for field in ("progress_text", "progress_step", "progress_total", "progress_at"):
+            self.assertIsNone(status["dispatches"][0][field])
         with sqlite3.connect(self.db) as db:
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
@@ -1245,10 +1248,11 @@ class TeamUpTest(unittest.TestCase):
         self.report(dispatch, turn, expected=1)
         self.assertEqual(self.invoke("retry", dispatch)["retry_of"], dispatch)
 
-    def test_wait_ignores_heartbeats_and_coordinator_events_until_timeout(self):
+    def test_wait_ignores_heartbeats_progress_and_coordinator_events_until_timeout(self):
         run = self.run_create()
         dispatch, turn = self.start(run, self.task(run, "Keep working"))
         self.invoke("heartbeat", dispatch, "--turn", turn)
+        self.invoke("progress", dispatch, "--turn", turn, "Still working")
         self.invoke("instruct", dispatch, "Coordinator update")
         self.invoke("turn-ended", dispatch, "--turn", turn)
         self.exit_worker(dispatch, turn)
@@ -1261,6 +1265,56 @@ class TeamUpTest(unittest.TestCase):
             last_event = db.execute("SELECT max(id) FROM events WHERE run_id = ?", (run,)).fetchone()[0]
         self.assertEqual(observed["cursor"], last_event)
         self.assertEqual(self.invoke("ack", run, observed["cursor"])["cursor"], last_event)
+
+    def test_progress_reports_only_for_the_active_running_turn(self):
+        worktree = self.linked_worktree()
+        run = self.run_create()
+        task = self.task(run, "Report progress")
+        dispatch = self.invoke("reserve", run, "--task", task,
+                               "--worktree", worktree, "--branch", "assigned")["id"]
+        self.invoke("progress", dispatch, "--turn", 1, "Too soon", expected=1)
+        turn = self.begin(dispatch)
+        self.started(dispatch, turn)
+        first = self.invoke("progress", dispatch, "--turn", turn, "Planning")
+        self.assertEqual((first["progress_step"], first["progress_total"]), (None, None))
+        self.invoke("progress", dispatch, "--turn", turn, "--step", "1/3", "Plan ready")
+        report = self.invoke("progress", dispatch, "--turn", turn, "Checking sources")
+        self.assertEqual((report["progress_step"], report["progress_total"]), (1, 3))
+        self.assertEqual(report["progress_at"], report["heartbeat_at"])
+        saved = self.invoke("status", run)["dispatches"][0]
+        with sqlite3.connect(self.db) as db:
+            event = json.loads(db.execute(
+                "SELECT data FROM events WHERE kind = 'progress' AND dispatch_id = ? ORDER BY id DESC LIMIT 1",
+                (dispatch,),
+            ).fetchone()[0])
+        self.assertEqual(event["turn"], turn)
+        for field in ("progress_text", "progress_step", "progress_total", "progress_at", "heartbeat_at"):
+            self.assertEqual(saved[field], report[field])
+            self.assertEqual(event[field], report[field])
+        question = self.invoke("record", dispatch, "--turn", turn, "Proceed?")
+        self.invoke("turn-ended", dispatch, "--turn", turn)
+        self.invoke("progress", dispatch, "--turn", turn, "Too late", expected=1)
+        self.exit_worker(dispatch, turn)
+        self.invoke("progress", dispatch, "--turn", turn, "Waiting", expected=1)
+        self.invoke("answer", question["id"], "Yes")
+        resumed = self.invoke("begin", dispatch)
+        self.assertEqual(resumed["turn"], turn + 1)
+        for field in ("progress_text", "progress_step", "progress_total", "progress_at"):
+            self.assertIsNone(resumed[field])
+        self.invoke("progress", dispatch, "--turn", turn, "Stale", expected=1)
+        self.invoke("progress", dispatch, "--turn", turn + 1, "Resumed")
+
+    def test_progress_validates_step_and_bounds_text(self):
+        run = self.run_create()
+        dispatch, turn = self.start(run, self.task(run, "Report a step"))
+        for step in ("one/two", "1", "1/2/3", "0/2", "2/1", "1/0", "1/9223372036854775808"):
+            with self.subTest(step=step):
+                self.invoke("progress", dispatch, "--turn", turn, "--step=" + step, "Work", expected=2)
+        text = "일" * 200
+        report = self.invoke("progress", dispatch, "--turn", turn, "--step", "2/2", text)
+        self.assertEqual(report["progress_text"], text)
+        self.invoke("progress", dispatch, "--turn", turn, text + "일", expected=1)
+        self.assertEqual(self.invoke("status", run)["dispatches"][0]["progress_text"], text)
 
     def test_wait_wakes_on_done_and_replays_until_acknowledged(self):
         run = self.run_create()
@@ -1362,6 +1416,67 @@ class TeamUpTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, f"진행 중 (1)\n  #{queued} codex First line goal  대기열\n")
         self.invoke("board", 99, expected=1)
+
+    def test_board_shows_running_progress_and_worktree_diff_stats(self):
+        worktree = self.linked_worktree()
+        run = self.run_create()
+        task = self.task(run, "Implement progress")
+        dispatch, turn = self.start(run, task, "--worktree", worktree, "--branch", "assigned")
+        report = self.invoke("progress", dispatch, "--turn", turn, "--step", "2/3", "Check\nresults")
+
+        def card():
+            return self.invoke("board", run, "--json")["groups"][1]["tasks"][0]
+
+        self.assertEqual(card()["diff_stats"], {"files": 0, "added": 0, "deleted": 0})
+        readme = worktree / "README.md"
+        readme.write_bytes(readme.read_bytes().partition(b"\n")[2])
+        subprocess.run(["git", "add", "README.md"], cwd=worktree, check=True, timeout=30)
+        with readme.open("ab") as file:
+            file.write(b"\nA new line of text.\n")
+        (worktree / "new\tfile\r.txt").write_bytes(b"first\nsecond")
+        (worktree / "binary.dat").write_bytes(b"one\0two\n")
+        (worktree / "empty.txt").touch()
+        running = card()
+        self.assertEqual(running["dispatch_id"], dispatch)
+        self.assertEqual((running["progress_step"], running["progress_total"]), (2, 3))
+        self.assertEqual(running["progress_text"], "Check\nresults")
+        self.assertEqual(running["last_update_at"], report["progress_at"])
+        self.assertFalse(running["stalled"])
+        self.assertEqual(running["diff_stats"], {"files": 4, "added": 4, "deleted": 1})
+        result = subprocess.run([*self.command, "board", str(run)], cwd=self.cwd,
+                                capture_output=True, text=True, timeout=30, check=True)
+        self.assertIn(f"2/3 단계 · Check results · 4개 파일 +4 -1 · {report['progress_at']}", result.stdout)
+        worktree.rename(worktree.with_name("moved worktree"))
+        self.assertIsNone(card()["diff_stats"])
+        worktree.mkdir()
+        (worktree / ".git").write_text("gitdir: /missing/worktree\n", encoding="utf-8")
+        self.assertIsNone(card()["diff_stats"])
+
+    def test_board_marks_stalls_using_the_latest_worker_update(self):
+        run = self.run_create()
+        task = self.task(run, "Check a stalled worker")
+        dispatch, turn = self.start(run, task)
+        report = self.invoke("progress", dispatch, "--turn", turn, "Waiting for tests")
+        old = (datetime.now(timezone.utc) - timedelta(minutes=11)).isoformat(timespec="milliseconds")
+
+        def set_times(heartbeat_at, progress_at):
+            with closing(sqlite3.connect(self.db)) as db, db:
+                db.execute("UPDATE dispatches SET heartbeat_at = ?, progress_at = ? WHERE id = ?",
+                           (heartbeat_at, progress_at, dispatch))
+            return self.invoke("board", run, "--json")["groups"][1]["tasks"][0]
+
+        fresh = report["progress_at"]
+        for heartbeat_at, progress_at in ((old, fresh), (fresh, old)):
+            with self.subTest(heartbeat_at=heartbeat_at, progress_at=progress_at):
+                running = set_times(heartbeat_at, progress_at)
+                self.assertFalse(running["stalled"])
+                self.assertEqual(running["last_update_at"], fresh)
+        stalled = set_times(old, old)
+        self.assertTrue(stalled["stalled"])
+        self.assertEqual(stalled["last_update_at"], old)
+        result = subprocess.run([*self.command, "board", str(run)], cwd=self.cwd,
+                                capture_output=True, text=True, timeout=30, check=True)
+        self.assertIn("⚠ 정체 · Waiting for tests", result.stdout)
 
     def test_wait_cursor_preserves_actionable_events_beyond_a_full_batch(self):
         run = self.run_create()
