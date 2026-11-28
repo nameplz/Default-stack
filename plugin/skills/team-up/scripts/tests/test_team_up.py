@@ -121,11 +121,13 @@ class TeamUpTest(unittest.TestCase):
         self.db = Path(temp.name) / "state with spaces.db"
         self.command = [sys.executable, "-B", str(SCRIPT), "--db", str(self.db)]
         self.cwd = REPO
+        self.fake_gh = self.db.parent / "fake gh"
 
-    def invoke(self, *args, expected=0, stderr=None):
+    def invoke(self, *args, expected=0, stderr=None, env=None):
         result = subprocess.run(
             [*self.command, *map(str, args)],
-            cwd=self.cwd, capture_output=True, text=True, timeout=30,
+            cwd=self.cwd, env={**os.environ, **(env or {}), "TEAM_UP_GH": str(self.fake_gh)},
+            capture_output=True, text=True, timeout=30,
         )
         self.assertEqual(result.returncode, expected, result.stderr or result.stdout)
         if stderr is not None:
@@ -233,6 +235,255 @@ class TeamUpTest(unittest.TestCase):
         )
         self.cwd = checkout
         return worktree
+
+    def pr_fixture(self, **overrides):
+        if not self.fake_gh.exists():
+            self.fake_gh.write_text(
+                "#!/usr/bin/python3\n"
+                "import json, os, sys, time\n"
+                "from pathlib import Path\n"
+                "root = Path(__file__).parent\n"
+                "args = sys.argv[1:]\n"
+                "with (root / 'gh.log').open('a') as log:\n"
+                "    print(json.dumps(args), file=log)\n"
+                "if args[:2] == ['pr', 'view']:\n"
+                "    failure = root / 'fail-view'\n"
+                "    if failure.exists():\n"
+                "        failure.unlink()\n"
+                "        sys.exit('temporary GitHub failure')\n"
+                "    time.sleep(float(os.environ.get('TEAM_UP_TEST_GH_SLEEP', '0')))\n"
+                "    print((root / 'pr.json').read_text())\n"
+                "elif args[:2] == ['pr', 'merge'] and '--disable-auto' in args:\n"
+                "    if os.environ.get('TEAM_UP_TEST_GH_FAIL_DISABLE'):\n"
+                "        sys.exit('temporary disarm failure')\n"
+                "    fixture = root / 'pr.json'\n"
+                "    data = json.loads(fixture.read_text())\n"
+                "    data['autoMergeRequest'] = None\n"
+                "    fixture.write_text(json.dumps(data))\n"
+                "elif args[:2] != ['pr', 'merge'] and args[:2] != ['pr', 'update-branch']:\n"
+                "    sys.exit('Unexpected gh command')\n",
+                encoding="utf-8",
+            )
+            self.fake_gh.chmod(0o700)
+        state = {
+            "headRefOid": "a" * 40,
+            "statusCheckRollup": [{"__typename": "CheckRun", "status": "IN_PROGRESS", "conclusion": ""}],
+            "mergeable": "MERGEABLE", "mergeStateStatus": "BLOCKED",
+            "autoMergeRequest": None, "state": "OPEN", "mergeCommit": None,
+            "files": [{"path": "src/example.py"}], "changedFiles": 1, "baseRefName": "main",
+            "url": "https://github.example/owner/repo/pull/42",
+        }
+        (self.db.parent / "pr.json").write_text(json.dumps({**state, **overrides}), encoding="utf-8")
+
+    def gh_writes(self):
+        log = self.db.parent / "gh.log"
+        calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+        return [args for args in calls if args[:2] != ["pr", "view"]]
+
+    def delivered_pr_dispatch(self, slots=2, *run_options):
+        checkout = self.linked_worktree()
+        run = self.run_create(slots, *run_options)
+        task = self.task(run, "Follow the PR")
+        dispatch, turn = self.start(run, task, "--worktree", checkout, "--branch", "assigned")
+        self.report(dispatch, turn)
+        self.exit_worker(dispatch, turn)
+        self.invoke("delivered", dispatch)
+        return run, task, dispatch
+
+    def approve_pr(self, run, task):
+        self.invoke("gate", run, "merge", "--decision", "approve")
+        self.assertEqual(self.invoke("pr-policy", task, "auto", "--gate", "merge")["policy"], "auto")
+
+    def test_slow_pr_sync_leaves_worker_writes_available(self):
+        run, _, dispatch = self.delivered_pr_dispatch()
+        self.pr_fixture()
+        self.invoke("pr-open", dispatch, "--number", 42)
+        worker, turn = self.start(run, self.task(run, "Keep working during sync"))
+        log = self.db.parent / "gh.log"
+        log.unlink()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            sync = pool.submit(self.invoke, "pr-sync", run, env={"TEAM_UP_TEST_GH_SLEEP": "6"})
+            deadline = time.monotonic() + 5
+            while not (log.exists() and log.stat().st_size) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(log.exists() and log.stat().st_size, "fake gh did not start")
+            self.assertEqual(self.invoke("heartbeat", worker, "--turn", turn)["turn"], turn)
+            self.assertFalse(sync.done(), "heartbeat must complete while fake gh is sleeping")
+            sync.result()
+
+    def test_pr_open_tracks_hold_before_disarming_and_can_retry(self):
+        run, _, dispatch = self.delivered_pr_dispatch()
+        self.pr_fixture(autoMergeRequest={"enabledAt": "now"})
+        self.invoke("pr-open", dispatch, "--number", 42, expected=1,
+                    env={"TEAM_UP_TEST_GH_FAIL_DISABLE": "1"})
+        pr = self.invoke("status", run)["pull_requests"][0]
+        self.assertEqual((pr["policy"], pr["auto_merge"]), ("hold", 1))
+        retried = self.invoke("pr-open", dispatch, "--number", 42)
+        self.assertEqual((retried["id"], retried["auto_merge"]), (pr["id"], 0))
+
+    def test_pr_approval_gate_is_dedicated_to_one_pr(self):
+        run, task, dispatch = self.delivered_pr_dispatch()
+        self.pr_fixture()
+        self.invoke("pr-open", dispatch, "--number", 42)
+        other = self.task(run, "Another PR", "--gate", "start-work")
+        self.invoke("gate", run, "start-work", "--decision", "approve")
+        self.invoke("pr-policy", task, "auto", "--gate", "start-work", expected=1)
+        other_dispatch, turn = self.start(run, other)
+        self.report(other_dispatch, turn)
+        self.exit_worker(other_dispatch, turn)
+        self.invoke("delivered", other_dispatch)
+        self.invoke("pr-open", other_dispatch, "--number", 43)
+        self.approve_pr(run, task)
+        self.invoke("pr-policy", task, "hold")
+        self.invoke("pr-policy", other, "auto", "--gate", "merge", expected=1)
+        self.assertEqual(self.invoke("status", run)["pull_requests"][0]["approval_gate"], "merge")
+        self.invoke("task-create", run, "--worker", "codex", "--goal", "Reuse PR gate",
+                    "--scope", "src/", "--evidence", "Show tests", "--gate", "merge", expected=1)
+        self.approve_pr(run, task)
+
+    def test_wait_retries_a_failed_pr_sync(self):
+        run, _, dispatch = self.delivered_pr_dispatch()
+        self.pr_fixture(statusCheckRollup=[{"state": "FAILURE"}])
+        self.invoke("pr-open", dispatch, "--number", 42)
+        self.invoke("ack", run, self.invoke("wait", run, "--timeout", 0)["cursor"])
+        failure = self.db.parent / "fail-view"
+        failure.touch()
+        rejected = self.invoke("pr-sync", run, expected=1)
+        self.assertIn("temporary GitHub failure", rejected.stderr)
+        failure.touch()
+        watched = subprocess.run(
+            [*self.command, "wait", str(run), "--timeout", "10", "--sync-prs", "1"],
+            cwd=self.cwd, env={**os.environ, "TEAM_UP_GH": str(self.fake_gh)},
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(watched.returncode, 0, watched.stderr)
+        self.assertIn("temporary GitHub failure", watched.stderr)
+        self.assertEqual([event["kind"] for event in json.loads(watched.stdout)["events"]], ["pr-checks-failed"])
+
+    def test_pr_arm_requires_auto_policy_and_healthy_checks(self):
+        run, task, dispatch = self.delivered_pr_dispatch()
+        self.pr_fixture()
+        self.invoke("pr-open", dispatch, "--number", 42, "--policy", "auto", expected=1)
+        pr = self.invoke("pr-open", dispatch, "--number", 42)
+        self.assertEqual((pr["policy"], pr["auto_merge"]), ("hold", 0))
+        self.invoke("pr-open", dispatch, "--number", 43, expected=1)
+        self.invoke("pr-arm", task, expected=1)
+        self.invoke("pr-policy", task, "manual")
+        self.invoke("pr-arm", task, expected=1)
+        self.invoke("pr-policy", task, "auto", "--gate", "merge", expected=1)
+        self.assertEqual(self.gh_writes(), [])
+        self.approve_pr(run, task)
+        self.pr_fixture(statusCheckRollup=[{"state": "FAILURE"}])
+        refused = self.invoke("pr-arm", task, expected=1)
+        self.assertIn("failing checks", refused.stderr)
+        self.assertEqual(self.gh_writes(), [])
+        self.pr_fixture()
+        self.assertEqual(self.invoke("pr-arm", task)["auto_merge"], 1)
+        self.assertEqual(self.gh_writes(), [
+            ["pr", "merge", "42", "--auto", "--squash", "--match-head-commit", "a" * 40],
+        ])
+
+    def test_pr_path_policy_downgrades_and_disables_an_armed_pr_on_new_head(self):
+        run, task, dispatch = self.delivered_pr_dispatch()
+        policy = self.cwd / ".github" / "merge-policy"
+        policy.parent.mkdir(exist_ok=True)
+        policy.write_text("# Approval paths\nprotected/**/*.py\nconfig/**/live/**/settings.yml\n", encoding="utf-8")
+        self.pr_fixture(files=[{"path": "protected/direct.py"}])
+        self.assertEqual(self.invoke("pr-open", dispatch, "--number", 42, "--policy", "manual")["policy"], "hold")
+        self.invoke("gate", run, "merge", "--decision", "approve")
+        self.invoke("pr-policy", task, "auto", "--gate", "merge", expected=1)
+        self.pr_fixture()
+        self.assertEqual(self.invoke("pr-sync", run)["pull_requests"][0]["policy"], "hold")
+        self.approve_pr(run, task)
+        self.invoke("pr-arm", task)
+        self.pr_fixture(headRefOid="b" * 40, autoMergeRequest={"enabledAt": "now"},
+                        files=[{"path": "config/live/subdir/settings.yml"}])
+        pr = self.invoke("pr-sync", run)["pull_requests"][0]
+        self.assertEqual((pr["policy"], pr["auto_merge"]), ("hold", 0))
+        self.assertEqual(self.gh_writes()[-1], ["pr", "merge", "42", "--disable-auto"])
+        self.pr_fixture(headRefOid="c" * 40)
+        self.assertEqual(self.invoke("pr-sync", run)["pull_requests"][0]["policy"], "hold")
+        result = self.invoke("wait", run, "--timeout", 0)
+        self.assertEqual([event["kind"] for event in result["events"]].count("pr-policy-downgraded"), 1)
+        self.approve_pr(run, task)
+        self.pr_fixture(headRefOid="d" * 40, changedFiles=101)
+        refused = self.invoke("pr-arm", task, expected=1)
+        self.assertIn("merge-policy", refused.stderr)
+        self.assertEqual(self.invoke("status", run)["pull_requests"][0]["policy"], "hold")
+        self.assertEqual(sum("--auto" in call for call in self.gh_writes()), 1)
+
+    def test_pr_sync_updates_only_auto_and_records_merge_for_dependents(self):
+        run, task, dispatch = self.delivered_pr_dispatch(2, "--base", "origin/main")
+        self.pr_fixture(mergeStateStatus="BEHIND")
+        self.invoke("pr-open", dispatch, "--number", 42)
+        self.invoke("pr-sync", run)
+        self.assertEqual(self.gh_writes(), [])
+        self.approve_pr(run, task)
+        self.invoke("pr-sync", run)
+        self.assertEqual(self.gh_writes(), [["pr", "update-branch", "42"]])
+        dependent = self.task(run, "After the merge", "--after-merge", task)
+        self.assertIsNone(self.invoke("reserve", run, "--task", dependent))
+        sha = "d" * 40
+        self.pr_fixture(state="MERGED", mergeCommit={"oid": sha})
+        self.assertEqual(self.invoke("pr-sync", run)["pull_requests"][0]["merged_commit"], sha)
+        self.assertEqual(self.invoke("pr-sync", run)["pull_requests"], [])
+        current = self.invoke("status", run)["tasks"][0]
+        self.assertEqual((current["merged_base"], current["merged_commit"]), ("origin/main", sha))
+        self.assertEqual(self.invoke("reserve", run, "--task", dependent)["task_id"], dependent)
+        events = self.invoke("wait", run, "--timeout", 0)["events"]
+        self.assertEqual([event["kind"] for event in events].count("pr-merged"), 1)
+
+    def test_pr_wait_and_fix_rounds_require_a_slot_and_stop_after_three(self):
+        run, task, dispatch = self.delivered_pr_dispatch(1)
+        self.pr_fixture(statusCheckRollup=[{"state": "SUCCESS"}])
+        self.invoke("pr-open", dispatch, "--number", 42)
+        self.invoke("ack", run, self.invoke("wait", run, "--timeout", 0)["cursor"])
+        watched = self.invoke("wait", run, "--timeout", 0.1, "--sync-prs", 1)
+        self.assertEqual([event["kind"] for event in watched["events"]], ["pr-checks-passed"])
+        board = self.invoke("board", run, "--json")
+        self.assertEqual(board["groups"][0]["tasks"][0]["fact"], "PR #42 승인 필요")
+        self.invoke("ack", run, watched["cursor"])
+        self.pr_fixture(statusCheckRollup=[{"status": "COMPLETED", "conclusion": "FAILURE"}],
+                        mergeable="CONFLICTING", mergeStateStatus="DIRTY")
+        watched = self.invoke("wait", run, "--timeout", 30, "--sync-prs", 1)
+        self.assertEqual([event["kind"] for event in watched["events"]], ["pr-checks-failed", "pr-conflict"])
+        self.invoke("ack", run, watched["cursor"])
+        self.assertEqual(self.invoke("wait", run, "--timeout", 0, "--sync-prs", 1)["events"], [])
+        other = self.task(run, "Occupy the only slot")
+        occupied = self.invoke("reserve", run, "--task", other)["id"]
+        self.invoke("instruct", dispatch, "Fix the PR")
+        refused = self.invoke("begin", dispatch, expected=1)
+        self.assertIn("no run slot", refused.stderr)
+        self.assertEqual(self.invoke("status", run)["pull_requests"][0]["fix_rounds"], 0)
+        self.invoke("abandon", occupied, "--reason", "Free the slot")
+        for round_number in range(1, 4):
+            turn = self.begin(dispatch)
+            self.assertEqual(self.invoke("status", run)["pull_requests"][0]["fix_rounds"], round_number)
+            self.started(dispatch, turn)
+            self.report(dispatch, turn)
+            self.exit_worker(dispatch, turn)
+            self.invoke("delivered", dispatch)
+            self.invoke("instruct", dispatch, "Fix the PR")
+        refused = self.invoke("begin", dispatch, expected=1)
+        self.assertIn("3 fix rounds", refused.stderr)
+        board = self.invoke("board", run, "--json")
+        self.assertEqual(board["groups"][0]["tasks"][0]["fact"], "수정 3회 · 확인 필요")
+        self.assertEqual(self.gh_writes(), [])
+
+    def test_pr_fix_waits_until_auto_merge_is_disarmed(self):
+        run, task, dispatch = self.delivered_pr_dispatch()
+        self.pr_fixture()
+        self.invoke("pr-open", dispatch, "--number", 42)
+        self.approve_pr(run, task)
+        self.pr_fixture(statusCheckRollup=[{"state": "FAILURE"}], autoMergeRequest={"enabledAt": "now"})
+        self.invoke("pr-sync", run)
+        self.invoke("instruct", dispatch, "Fix checks")
+        refused = self.invoke("begin", dispatch, expected=1)
+        self.assertIn("disable auto-merge", refused.stderr)
+        self.assertEqual(self.invoke("status", run)["pull_requests"][0]["fix_rounds"], 0)
+        self.invoke("pr-policy", task, "hold")
+        self.assertEqual(self.gh_writes(), [["pr", "merge", "42", "--disable-auto"]])
+        self.assertEqual(self.begin(dispatch), 2)
 
     def test_only_init_creates_or_changes_journal(self):
         self.invoke("run-create", "--goal", "Run", "--slots", 1, expected=1)
@@ -385,6 +636,7 @@ class TeamUpTest(unittest.TestCase):
         status = self.invoke("status", 7)
         self.assertEqual(status["run"]["notes_version"], 0)
         self.assertEqual(status["notes"], [])
+        self.assertEqual(status["pull_requests"], [])
         self.assertIsNone(status["dispatches"][0]["notes_version"])
         with sqlite3.connect(self.db) as db:
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)

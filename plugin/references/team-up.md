@@ -280,6 +280,15 @@ If the current turn has no runtime handle, `turn-ended` and `exited` warn on std
 
 If worker activity is still expected in the Claude desktop app's Code tab, start `wait <run-id> --timeout 30` as a background Bash job and end the turn. The job's completion wakes the coordinator. In an active CLI coordinator, poll with `wait <run-id> --timeout 30` and reconcile after each return. If the CLI coordinator exits, resume its saved session and name the absolute DB path and Run ID in the prompt. Use `claude -p --resume <coordinator-session-id>` for Claude Code CLI. For Codex CLI, follow the [Codex coordinator pickup procedure](#codex-coordinator). For agy, follow the [agy coordinator pickup procedure](#agy-coordinator).
 
+## Follow up on pull requests
+
+1. Record delivery, then register the open PR with `pr-open <dispatch-id> --number <number>`. The default policy is `hold`. Use `--policy manual` when the user plans to merge. A matching glob in the coordinator checkout's `.github/merge-policy` forces `hold`. Put one glob per line and start comment lines with `#`.
+2. Use `wait <run-id> --sync-prs 15` to poll GitHub. Check failures and conflicts wake the coordinator. Read the other PR events on the next wake or timeout. GitHub's merged state records the merge for Tasks that depend on it.
+3. For a failure or conflict, queue an `instruct` on the same Dispatch. If the PR is armed, run `gh pr merge <number> --disable-auto` and then `pr-sync <run-id>`. Call `begin` after the worker exits and a slot frees up. Resume the saved session and publish the reviewed fix. After three fix rounds, bring the remaining failure or conflict to the user. The board puts it under 내 차례.
+4. When the user explicitly approves auto-merge, create a new gate dedicated to that PR, such as `merge-pr-<number>`. Record approval with `gate <run-id> <name> --decision approve`, then run `pr-policy <task-id> auto --gate <name>`. Confirm the target branch requires the `verify` check before using `pr-arm <task-id>`. Use `pr-policy <task-id> hold` or `manual` to record a change in the user's decision. Never merge with `--admin`.
+
+GitHub can merge an armed PR between polls. If other actors can push to an armed PR, enforce paths requiring approval in GitHub branch protection. Use `hold` for merge queues unless GitHub enforces the same policy, since disabling auto-merge does not remove a queued PR.
+
 ## Report progress with the board
 
 When you report progress to the user, run `board <run-id>` and show its output as is. It is read-only and places each Task in one group: 내 차례 (unanswered questions, undecided gates, three start failures), 진행 중 (open Dispatches and ready Tasks marked 대기열), 검토 대기, 머지 중, 막힘 (with `←` naming what the Task waits on), and 완료. Lead with the 내 차례 items. Use `board <run-id> --json` when you need the same groups as data, and `status` when you need the raw records.

@@ -4,6 +4,8 @@
 import argparse
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
+import fcntl
+from fnmatch import fnmatchcase
 import hashlib
 import json
 import math
@@ -19,6 +21,12 @@ SCHEMA_VERSION = 5
 RUN_NOTES_LIMIT = 4096
 RUN_NOTES_TRUNCATED = b"\n[Run notes truncated]"
 ACTIVE_WORKERS = ("claude", "codex")
+PR_POLICIES = ("auto", "hold", "manual")
+PR_FIX_LIMIT = 3
+PR_VIEW_FIELDS = ("headRefOid,statusCheckRollup,mergeable,mergeStateStatus,autoMergeRequest,"
+                  "state,mergeCommit,files,url,baseRefName,changedFiles")
+WAKE_EVENTS = ("question", "done", "pr-checks-failed", "pr-conflict")
+PR_INFO_EVENTS = ("pr-checks-passed", "pr-behind", "pr-merged", "pr-closed", "pr-policy-downgraded")
 # Keep agy for historical records; ACTIVE_WORKERS governs new work.
 TASKS_SCHEMA = """CREATE TABLE {} (
     id INTEGER PRIMARY KEY,
@@ -127,6 +135,30 @@ CREATE TABLE run_notes (
     created_at TEXT NOT NULL
 );
 CREATE INDEX run_notes_run ON run_notes(run_id, id);
+CREATE TABLE pull_requests (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    task_id INTEGER NOT NULL REFERENCES tasks(id),
+    dispatch_id INTEGER NOT NULL REFERENCES dispatches(id),
+    number INTEGER NOT NULL CHECK (number > 0),
+    url TEXT,
+    policy TEXT NOT NULL CHECK (policy IN ('auto', 'hold', 'manual')),
+    approval_gate TEXT,
+    state TEXT NOT NULL DEFAULT 'OPEN' CHECK (state IN ('OPEN', 'CLOSED', 'MERGED')),
+    head_sha TEXT,
+    checks TEXT CHECK (checks IN ('pending', 'passing', 'failing')),
+    mergeable TEXT,
+    merge_state TEXT,
+    auto_merge INTEGER NOT NULL DEFAULT 0 CHECK (auto_merge IN (0, 1)),
+    fix_rounds INTEGER NOT NULL DEFAULT 0 CHECK (fix_rounds BETWEEN 0 AND 3),
+    merged_commit TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (run_id, approval_gate) REFERENCES gates(run_id, name)
+);
+CREATE UNIQUE INDEX one_open_pr_per_task ON pull_requests(task_id) WHERE state = 'OPEN';
+CREATE UNIQUE INDEX one_open_pr_per_number ON pull_requests(number) WHERE state = 'OPEN';
+CREATE UNIQUE INDEX one_pr_per_approval_gate ON pull_requests(run_id, approval_gate) WHERE approval_gate IS NOT NULL;
 """
 
 
@@ -386,6 +418,9 @@ def create_task(db, args):
     db.executemany("INSERT INTO dependencies VALUES (?, ?, ?)",
                    ((task_id, prerequisite, condition) for prerequisite, condition in dependencies.items()))
     for name in dict.fromkeys(args.gate):
+        if db.execute("SELECT 1 FROM pull_requests WHERE run_id = ? AND approval_gate = ?",
+                      (args.run, name)).fetchone():
+            raise StateError(f"gate {name!r} is dedicated to PR approval")
         db.execute("INSERT OR IGNORE INTO gates(run_id, name) VALUES (?, ?)", (args.run, name))
         db.execute("INSERT INTO task_gates VALUES (?, ?, ?)", (args.run, task_id, name))
     event(db, args.run, "task-created", {}, task_id=task_id)
@@ -423,13 +458,352 @@ def mark_merged(db, args):
         task = task_row(db, args.task)
         if task["completed_at"] is None:
             raise StateError("the task needs a successful completion report before recording a merge")
-        if task["merged_commit"] is not None:
-            if task["merged_commit"] != sha or task["merged_base"] != base:
-                raise StateError("the task already has a recorded merge")
-            return dict(task)
-        db.execute("UPDATE tasks SET merged_base = ?, merged_commit = ? WHERE id = ?", (base, sha, args.task))
-        event(db, task["run_id"], "task-merged", {"base": base, "commit": sha}, task_id=args.task)
-        return dict(task_row(db, args.task))
+        return record_merge(db, task, base, sha)
+
+
+def record_merge(db, task, base, sha):
+    if task["merged_commit"] is not None:
+        if task["merged_commit"] != sha or task["merged_base"] != base:
+            raise StateError("the task already has a recorded merge")
+        return dict(task)
+    db.execute("UPDATE tasks SET merged_base = ?, merged_commit = ? WHERE id = ?", (base, sha, task["id"]))
+    event(db, task["run_id"], "task-merged", {"base": base, "commit": sha}, task_id=task["id"])
+    return dict(task_row(db, task["id"]))
+
+
+def gh(directory, *args):
+    try:
+        result = subprocess.run(
+            [os.environ.get("TEAM_UP_GH", "gh"), *map(str, args)],
+            cwd=directory, text=True, capture_output=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise StateError(f"gh {' '.join(map(str, args[:3]))} timed out") from exc
+    if result.returncode:
+        raise StateError(result.stderr.strip() or f"gh {args[0]} {args[1]} failed ({result.returncode})")
+    return result.stdout
+
+
+def pr_directory(db):
+    if common_dir() != Path(repository_common_dir(db)):
+        raise StateError("database belongs to a different repository")
+    return Path(git("rev-parse", "--show-toplevel"))
+
+
+def pr_view(directory, number):
+    output = gh(directory, "pr", "view", number, "--json", PR_VIEW_FIELDS)
+    try:
+        remote = json.loads(output)
+        if (remote["state"] not in ("OPEN", "MERGED", "CLOSED") or not remote["headRefOid"]
+                or not isinstance(remote["statusCheckRollup"], (list, type(None)))
+                or "autoMergeRequest" not in remote):
+            raise ValueError
+    except (ValueError, TypeError, KeyError) as exc:
+        raise StateError(f"invalid GitHub state for PR #{number}") from exc
+    return remote
+
+
+def pr_requires_hold(directory, remote):
+    try:
+        lines = (directory / ".github" / "merge-policy").read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return False
+    except UnicodeError as exc:
+        raise StateError("could not read .github/merge-policy as UTF-8") from exc
+    globs = [line for line in map(str.strip, lines) if line and not line.startswith("#")]
+    if not globs:
+        return False
+    files = remote.get("files")
+    if not isinstance(files, list) or remote.get("changedFiles", len(files)) != len(files):
+        return True
+    return any(
+        not isinstance(file, dict) or not isinstance(file.get("path"), str) or not file["path"]
+        or file.get("changeType") == "RENAMED"
+        or any(path_matches(file["path"], pattern) for pattern in globs)
+        for file in files
+    )
+
+
+def path_matches(path, pattern):
+    parts = path.split("/")
+    positions = {0}
+    for glob in pattern.split("/"):
+        if glob == "**" and positions:
+            positions = set(range(min(positions), len(parts) + 1))
+        else:
+            positions = {i + 1 for i in positions if i < len(parts) and fnmatchcase(parts[i], glob)}
+    return len(parts) in positions
+
+
+def open_pr(db, task_id):
+    return db.execute("SELECT * FROM pull_requests WHERE task_id = ? AND state = 'OPEN'", (task_id,)).fetchone()
+
+
+@contextmanager
+def pr_command_lock(db):
+    database = db.execute("PRAGMA database_list").fetchone()[2]
+    with open(f"{database}.pr.lock", "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise StateError("another PR command is in progress; retry after it finishes") from exc
+        yield
+
+
+def pr_registration(db, args):
+    dispatch = dispatch_row(db, args.dispatch)
+    task = task_row(db, dispatch["task_id"])
+    if not dispatch["delivered"] or task["merged_commit"] is not None:
+        raise StateError("pr-open requires a delivered dispatch for an unmerged task")
+    old = open_pr(db, task["id"])
+    if old:
+        if (old["dispatch_id"], old["number"]) == (args.dispatch, args.number):
+            return dispatch, old
+        raise StateError(f"task {task['id']} already has open PR #{old['number']}")
+    if db.execute("SELECT 1 FROM pull_requests WHERE number = ? AND state = 'OPEN'", (args.number,)).fetchone():
+        raise StateError(f"PR #{args.number} already belongs to another task")
+    return dispatch, None
+
+
+def pr_open(db, args):
+    dispatch, old = pr_registration(db, args)
+    if old:
+        if old["policy"] != "auto" and old["auto_merge"]:
+            directory = pr_directory(db)
+            remote = pr_view(directory, old["number"])
+            return dict(reconcile_pr(db, run_row(db, old["run_id"]), old, directory, remote))
+        return dict(old)
+    directory = pr_directory(db)
+    remote = pr_view(directory, args.number)
+    if remote["state"] != "OPEN":
+        raise StateError(f"PR #{args.number} is not open on GitHub")
+    policy = "hold" if pr_requires_hold(directory, remote) else args.policy
+    if policy == "auto":
+        raise StateError("record the PR first, then use pr-policy auto with an approved gate")
+    with transaction(db):
+        dispatch, old = pr_registration(db, args)
+        if old:
+            return dict(old)
+        now = timestamp()
+        armed = remote["autoMergeRequest"] is not None
+        db.execute(
+            """INSERT INTO pull_requests
+            (run_id, task_id, dispatch_id, number, url, policy, auto_merge, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (dispatch["run_id"], dispatch["task_id"], args.dispatch, args.number,
+             args.url or remote.get("url"), policy, int(armed), now, now),
+        )
+        pr = open_pr(db, dispatch["task_id"])
+    if armed:
+        gh(directory, "pr", "merge", args.number, "--disable-auto")
+        set_pr_auto_merge(db, pr, False)
+    return dict(pr_by_id(db, pr["id"]))
+
+
+def require_open_pr(db, task_id):
+    task_row(db, task_id)
+    pr = open_pr(db, task_id)
+    if pr is None:
+        raise StateError(f"task {task_id} has no open PR")
+    return pr
+
+
+def pr_by_id(db, pr_id):
+    return db.execute("SELECT * FROM pull_requests WHERE id = ?", (pr_id,)).fetchone()
+
+
+def require_unchanged_pr(db, pr):
+    current = pr_by_id(db, pr["id"])
+    if current is None or current["updated_at"] != pr["updated_at"] or dict(current) != dict(pr):
+        raise StateError(f"PR #{pr['number']} changed while the command was running; retry")
+
+
+def require_pr_gate(db, pr, name):
+    gate = db.execute("SELECT decision FROM gates WHERE run_id = ? AND name = ?",
+                      (pr["run_id"], name)).fetchone()
+    if gate is None or gate["decision"] != "approve":
+        raise StateError("auto policy requires --gate naming an approved gate in this run")
+    if db.execute("SELECT 1 FROM task_gates WHERE run_id = ? AND name = ?",
+                  (pr["run_id"], name)).fetchone():
+        raise StateError(f"gate {name!r} is attached to a task; use a dedicated PR gate")
+    if db.execute("SELECT 1 FROM pull_requests WHERE run_id = ? AND approval_gate = ? AND id != ?",
+                  (pr["run_id"], name, pr["id"])).fetchone():
+        raise StateError(f"gate {name!r} already approved another PR")
+    if pr["approval_gate"] not in (None, name):
+        raise StateError(f"PR #{pr['number']} already has approval gate {pr['approval_gate']!r}")
+
+
+def pr_policy(db, args):
+    pr = require_open_pr(db, args.task)
+    gate = pr["approval_gate"]
+    if args.policy == "auto":
+        gate = args.gate
+        require_pr_gate(db, pr, gate)
+    error = None
+    try:
+        directory = pr_directory(db)
+        remote = pr_view(directory, pr["number"])
+    except (StateError, OSError) as exc:
+        if args.policy == "auto":
+            raise
+        error = exc
+    if args.policy == "auto":
+        if remote["state"] != "OPEN" or pr_requires_hold(directory, remote):
+            raise StateError(f"PR #{pr['number']} cannot use auto policy in its current GitHub state or merge policy")
+    with transaction(db):
+        require_unchanged_pr(db, pr)
+        if args.policy == "auto":
+            require_pr_gate(db, pr, gate)
+        if (args.policy, gate) != (pr["policy"], pr["approval_gate"]):
+            db.execute("UPDATE pull_requests SET policy = ?, approval_gate = ?, updated_at = ? WHERE id = ?",
+                       (args.policy, gate, timestamp(), pr["id"]))
+        current = pr_by_id(db, pr["id"])
+    if error:
+        raise error
+    if args.policy != "auto":
+        reconcile_pr(db, run_row(db, pr["run_id"]), current, directory, remote)
+    return dict(pr_by_id(db, pr["id"]))
+
+
+def pr_checks(checks):
+    if not checks:
+        return None
+    states = {check.get("conclusion") or check.get("state") or check.get("status") for check in checks}
+    if states & {"ACTION_REQUIRED", "CANCELLED", "ERROR", "FAILURE", "STALE", "STARTUP_FAILURE", "TIMED_OUT"}:
+        return "failing"
+    return "passing" if states <= {"SUCCESS", "NEUTRAL", "SKIPPED"} else "pending"
+
+
+def pr_conflict(pr):
+    return pr["mergeable"] == "CONFLICTING" or pr["merge_state"] == "DIRTY"
+
+
+def pr_base(run, remote, number):
+    target = remote.get("baseRefName")
+    base = run["base"] or target
+    if target and base not in (target, f"refs/heads/{target}", f"origin/{target}", f"refs/remotes/origin/{target}"):
+        raise StateError(f"PR #{number} targets {target!r}, expected {base!r}")
+    return base
+
+
+def observe_pr(db, run, pr, remote, requires_hold):
+    state = remote["state"]
+    policy = pr["policy"]
+    if requires_hold:
+        policy = "hold"
+    sha = (remote.get("mergeCommit") or {}).get("oid") if state == "MERGED" else None
+    current = {
+        "state": state, "policy": policy, "head_sha": remote["headRefOid"],
+        "checks": pr_checks(remote["statusCheckRollup"]), "mergeable": remote.get("mergeable"),
+        "merge_state": remote.get("mergeStateStatus"), "merged_commit": sha,
+        "auto_merge": int(state == "OPEN" and remote["autoMergeRequest"] is not None),
+    }
+    kinds = []
+    if state == "MERGED":
+        base = pr_base(run, remote, pr["number"])
+        if not sha or not base:
+            raise StateError(f"merged PR #{pr['number']} is missing its commit or base ref")
+        record_merge(db, task_row(db, pr["task_id"]), base, sha)
+        kinds.append("pr-merged")
+    elif state == "CLOSED":
+        kinds.append("pr-closed")
+    else:
+        new_head = current["head_sha"] != pr["head_sha"]
+        checks = current["checks"]
+        if new_head or checks != pr["checks"]:
+            kind = {"passing": "pr-checks-passed", "failing": "pr-checks-failed"}.get(checks)
+            if kind:
+                kinds.append(kind)
+        if pr_conflict(current) and (new_head or not pr_conflict(pr)):
+            kinds.append("pr-conflict")
+        if current["merge_state"] == "BEHIND" and (new_head or pr["merge_state"] != "BEHIND"):
+            kinds.append("pr-behind")
+        if policy != pr["policy"]:
+            kinds.append("pr-policy-downgraded")
+    if any(pr[key] != value for key, value in current.items()):
+        fields = ", ".join(f"{key} = ?" for key in current)
+        db.execute(f"UPDATE pull_requests SET {fields}, updated_at = ? WHERE id = ?",
+                   (*current.values(), timestamp(), pr["id"]))
+    for kind in kinds:
+        event(db, run["id"], kind, {"number": pr["number"], **current}, pr["task_id"], pr["dispatch_id"])
+
+
+def set_pr_auto_merge(db, pr, enabled):
+    with transaction(db):
+        require_unchanged_pr(db, pr)
+        db.execute("UPDATE pull_requests SET auto_merge = ?, updated_at = ? WHERE id = ?",
+                   (int(enabled), timestamp(), pr["id"]))
+
+
+def reconcile_pr(db, run, pr, directory, remote, *, sync=False):
+    requires_hold = (remote["state"] == "OPEN" and pr["policy"] == "auto"
+                     and pr_requires_hold(directory, remote))
+    with transaction(db):
+        require_unchanged_pr(db, pr)
+        observe_pr(db, run, pr, remote, requires_hold)
+        current = pr_by_id(db, pr["id"])
+    if current["state"] == "OPEN":
+        if current["policy"] != "auto" and current["auto_merge"]:
+            gh(directory, "pr", "merge", current["number"], "--disable-auto")
+            set_pr_auto_merge(db, current, False)
+        elif sync and current["policy"] == "auto" and current["merge_state"] == "BEHIND" and not current["auto_merge"]:
+            pr_base(run, remote, current["number"])
+            gh(directory, "pr", "update-branch", current["number"])
+    return pr_by_id(db, pr["id"])
+
+
+def pr_sync(db, args):
+    run = run_row(db, args.run)
+    rows = db.execute(
+        "SELECT id FROM pull_requests WHERE run_id = ? AND state = 'OPEN' ORDER BY id", (args.run,),
+    ).fetchall()
+    synced, errors = [], []
+    if rows:
+        directory = pr_directory(db)
+    for row in rows:
+        with pr_command_lock(db):
+            pr = pr_by_id(db, row["id"])
+            if pr["state"] == "OPEN":
+                try:
+                    remote = pr_view(directory, pr["number"])
+                    current = reconcile_pr(db, run, pr, directory, remote, sync=True)
+                except (StateError, OSError) as exc:
+                    errors.append(f"PR #{pr['number']}: {exc}")
+                else:
+                    synced.append(dict(current))
+    if errors:
+        raise StateError("\n".join(errors))
+    return {"run_id": args.run, "pull_requests": synced}
+
+
+def pr_arm(db, args):
+    pr = require_open_pr(db, args.task)
+    if pr["policy"] != "auto":
+        raise StateError(f"PR #{pr['number']} policy is {pr['policy']}; pr-arm requires auto")
+    directory = pr_directory(db)
+    run = run_row(db, pr["run_id"])
+    remote = pr_view(directory, pr["number"])
+    current = reconcile_pr(db, run, pr, directory, remote)
+    with transaction(db):
+        require_unchanged_pr(db, current)
+        if current["state"] != "OPEN":
+            refusal = "is no longer open"
+        elif current["policy"] != "auto":
+            refusal = "is held by .github/merge-policy"
+        elif current["checks"] == "failing":
+            refusal = "has failing checks"
+        elif pr_conflict(current):
+            refusal = "has merge conflicts"
+        else:
+            refusal = None
+            pr_base(run, remote, pr["number"])
+    if refusal:
+        raise StateError(f"PR #{pr['number']} {refusal}; auto-merge was not armed")
+    if not current["auto_merge"]:
+        gh(directory, "pr", "merge", current["number"], "--auto", "--squash",
+           "--match-head-commit", current["head_sha"])
+        set_pr_auto_merge(db, current, True)
+    return dict(pr_by_id(db, pr["id"]))
 
 
 READY = f"""
@@ -609,9 +983,19 @@ def begin(db, args):
             if db.execute("SELECT 1 FROM dispatches WHERE task_id = ? AND attempt > ?",
                           (dispatch["task_id"], dispatch["attempt"])).fetchone():
                 raise StateError("a newer dispatch already exists for this task")
+            pr = open_pr(db, dispatch["task_id"])
+            fixing_pr = (pr is not None and pr["dispatch_id"] == dispatch["id"]
+                         and (pr["checks"] == "failing" or pr_conflict(pr)))
+            if fixing_pr and pr["fix_rounds"] >= PR_FIX_LIMIT:
+                raise StateError(f"PR #{pr['number']} reached {PR_FIX_LIMIT} fix rounds; user review is required")
             if not slot_available(db, run_row(db, dispatch["run_id"])):
                 raise StateError("no run slot is available for the follow-up")
+            if fixing_pr and pr["auto_merge"]:
+                raise StateError(f"disable auto-merge on PR #{pr['number']} and run pr-sync before starting a fix")
             check_worktree_claim(db, dispatch["worktree"], args.dispatch)
+            if fixing_pr:
+                db.execute("UPDATE pull_requests SET fix_rounds = fix_rounds + 1, updated_at = ? WHERE id = ?",
+                           (timestamp(), pr["id"]))
             dispatch_event(db, dispatch, "completion-followed-up", evidence=json.loads(dispatch["evidence"]),
                            delivered=bool(dispatch["delivered"]))
             db.execute("UPDATE tasks SET completed_at = NULL WHERE id = ? AND merged_commit IS NULL",
@@ -905,25 +1289,39 @@ def done(db, args):
 
 def wait(db, args):
     deadline = time.monotonic() + args.timeout
-    cursor = 0
+    next_sync = time.monotonic()
+    kinds = WAKE_EVENTS + PR_INFO_EVENTS
     while True:
+        if args.sync_prs is not None and time.monotonic() >= next_sync:
+            try:
+                pr_sync(db, args)
+            except (StateError, OSError) as exc:
+                print(f"team-up: pr-sync: {exc}", file=sys.stderr)
+            next_sync = time.monotonic() + args.sync_prs
         with transaction(db, write=False):
-            cursor = max(cursor, run_row(db, args.run)["cursor"])
-            events = [decode(row, "data") for row in db.execute(
-                """SELECT * FROM events WHERE run_id = ? AND id > ?
-                AND kind IN ('question', 'done') ORDER BY id LIMIT 101""",
-                (args.run, cursor),
-            )]
-            if len(events) > 100:
-                return {"events": events[:100], "cursor": events[99]["id"]}
-            cursor = db.execute(
-                "SELECT coalesce(max(id), ?) FROM events WHERE run_id = ? AND id > ?",
-                (cursor, args.run, cursor),
-            ).fetchone()[0]
+            cursor = run_row(db, args.run)["cursor"]
+            wake = db.execute(
+                f"""SELECT 1 FROM events WHERE run_id = ? AND id > ?
+                AND kind IN ({', '.join('?' for _ in WAKE_EVENTS)}) LIMIT 1""",
+                (args.run, cursor, *WAKE_EVENTS),
+            ).fetchone()
+            if wake or time.monotonic() >= deadline:
+                events = [decode(row, "data") for row in db.execute(
+                    f"""SELECT * FROM events WHERE run_id = ? AND id > ?
+                    AND kind IN ({', '.join('?' for _ in kinds)}) ORDER BY id LIMIT 101""",
+                    (args.run, cursor, *kinds),
+                )]
+                if len(events) > 100:
+                    return {"events": events[:100], "cursor": events[99]["id"]}
+                cursor = db.execute(
+                    "SELECT coalesce(max(id), ?) FROM events WHERE run_id = ? AND id > ?",
+                    (cursor, args.run, cursor),
+                ).fetchone()[0]
+                return {"events": events, "cursor": cursor}
         remaining = deadline - time.monotonic()
-        if events or remaining <= 0:
-            return {"events": events, "cursor": cursor}
-        time.sleep(min(0.1, remaining))
+        if args.sync_prs is not None:
+            remaining = min(remaining, next_sync - time.monotonic())
+        time.sleep(max(0, min(0.1, remaining)))
 
 
 def ack(db, args):
@@ -945,6 +1343,7 @@ def status(db, args):
             "dispatches": "r.id",
             "dependencies": "r.task_id, r.prerequisite_id",
             "task_gates": "r.task_id, r.name",
+            "pull_requests": "r.id",
         }
         for table, order in order_by.items():
             rows = db.execute(
@@ -987,7 +1386,23 @@ def short_goal(goal, limit=48):
     return line if len(line) <= limit else line[:limit - 1] + "…"
 
 
-def board_entry(task, dispatches, dependencies, dependents, gates, messages, now):
+def board_pr(pr):
+    number = f"PR #{pr['number']}"
+    trouble = "충돌" if pr_conflict(pr) else "실패" if pr["checks"] == "failing" else None
+    if trouble and pr["fix_rounds"] >= PR_FIX_LIMIT:
+        return "needs_user", f"수정 {pr['fix_rounds']}회 · 확인 필요"
+    if pr["policy"] in ("hold", "manual") and pr["checks"] == "passing" and not trouble:
+        action = "승인 필요" if pr["policy"] == "hold" else "수동 머지"
+        return "needs_user", f"{number} {action}"
+    if trouble:
+        return "merging", f"{number} {trouble}"
+    detail = {"hold": "보류(hold)", "manual": "수동 머지"}.get(pr["policy"])
+    if detail is None:
+        detail = "자동머지" if pr["auto_merge"] else "검사 통과" if pr["checks"] == "passing" else "검사 중"
+    return "merging", f"{number} {detail}"
+
+
+def board_entry(task, dispatches, dependencies, dependents, gates, messages, pr, now):
     """Return (group, fact, details) for one task; the first matching group wins."""
     latest = dispatches[-1] if dispatches else None
     if latest and latest["phase"] != "closed":
@@ -1013,6 +1428,9 @@ def board_entry(task, dispatches, dependencies, dependents, gates, messages, now
         if waits:
             return "blocked", "← " + ", ".join(waits), {"waits_on": waits}
         return "in_progress", "대기열", {"queued": True}
+    if pr is not None:
+        group, fact = board_pr(pr)
+        return group, fact, {"pull_request": dict(pr)}
     start_failures = sum(1 for d in dispatches if d["outcome"] == "start-failed")
     if (latest["outcome"] == "start-failed" and start_failures >= 3
             and not latest["abandon_reason"] and not latest["taken_over"]):
@@ -1060,12 +1478,16 @@ def board(db, args):
             WHERE tg.run_id = ? ORDER BY tg.task_id, g.name""", (args.run,)
         ):
             gates.setdefault(row["task_id"], []).append(row)
+        prs = {row["task_id"]: row for row in db.execute(
+            """SELECT p.* FROM pull_requests p JOIN tasks t ON t.id = p.task_id
+            WHERE t.run_id = ? AND p.state = 'OPEN'""", (args.run,)
+        )}
     groups = {key: [] for key, _ in BOARD_GROUPS}
     for task in tasks:
         history = dispatches.get(task["id"], [])
         group, fact, details = board_entry(
             task, history, dependencies.get(task["id"], []), dependents.get(task["id"], []),
-            gates.get(task["id"], []), messages, now,
+            gates.get(task["id"], []), messages, prs.get(task["id"]), now,
         )
         groups[group].append({
             "task_id": task["id"], "worker": task["worker"], "goal": short_goal(task["goal"]),
@@ -1111,6 +1533,7 @@ def cleanup(db, args):
         """SELECT d.id, d.worktree, d.branch FROM dispatches d JOIN tasks t ON t.id = d.task_id
         WHERE t.run_id = ? AND d.worktree IS NOT NULL AND d.phase = 'closed'
         AND NOT d.review_main AND NOT d.keep_open AND NOT d.taken_over AND d.delivered
+        AND NOT EXISTS (SELECT 1 FROM pull_requests p WHERE p.dispatch_id = d.id AND p.state = 'OPEN')
         AND (d.abandon_reason IS NOT NULL OR NOT EXISTS (
             SELECT 1 FROM messages m WHERE m.dispatch_id = d.id AND m.kind = 'instruction' AND NOT m.consumed
         ))
@@ -1200,6 +1623,15 @@ def parser():
     merged = command("merged", mark_merged, "task", writes=False)
     merged.add_argument("--base", type=nonempty, required=True)
     merged.add_argument("--commit", type=nonempty, required=True)
+    pull_request = command("pr-open", pr_open, "dispatch", writes=False)
+    pull_request.add_argument("--number", type=positive_int, required=True)
+    pull_request.add_argument("--url", type=nonempty)
+    pull_request.add_argument("--policy", choices=PR_POLICIES, default="hold")
+    policy = command("pr-policy", pr_policy, "task", writes=False)
+    policy.add_argument("policy", choices=PR_POLICIES)
+    policy.add_argument("--gate", type=nonempty)
+    command("pr-sync", pr_sync, "run", writes=False)
+    command("pr-arm", pr_arm, "task", writes=False)
 
     reservation = command("reserve", reserve, "run")
     reservation.add_argument("--task", type=positive_int)
@@ -1237,7 +1669,9 @@ def parser():
     evidence_group.add_argument("--evidence", metavar="JSON")
     evidence_group.add_argument("--evidence-file", type=Path, metavar="PATH")
 
-    command("wait", wait, "run", writes=False).add_argument("--timeout", type=duration, default=30)
+    wait_command = command("wait", wait, "run", writes=False)
+    wait_command.add_argument("--timeout", type=duration, default=30)
+    wait_command.add_argument("--sync-prs", type=positive_int, metavar="SECONDS")
     command("ack", ack, "run").add_argument("event", type=nonnegative_int)
     command("status", status, "run", writes=False)
     command("board", board, "run", writes=False).add_argument("--json", action="store_true")
@@ -1257,6 +1691,9 @@ def main(argv=None):
                 result = {"db": str(path), "schema_version": SCHEMA_VERSION,
                           "sqlite_version": sqlite3.sqlite_version,
                           "journal_mode": db.execute("PRAGMA journal_mode").fetchone()[0]}
+            elif args.command in ("pr-open", "pr-policy", "pr-arm"):
+                with pr_command_lock(db):
+                    result = args.handler(db, args)
             elif args.writes:
                 with transaction(db):
                     result = args.handler(db, args)
