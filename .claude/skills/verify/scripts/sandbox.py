@@ -12,6 +12,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 
 
 SOURCE = Path(__file__).resolve().parents[4]
@@ -22,6 +23,7 @@ PYTHON = os.environ.get("VERIFY_TEAM_UP_PYTHON", "/usr/bin/python3")
 GIT_ENV = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
 GIT_ENV.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
 FILE = "README.md"
+V4_REVISION = "c94b299"
 
 
 class Sandbox:
@@ -32,6 +34,7 @@ class Sandbox:
         self.worker = root / "worker"
         self.db = root / "state.db"
         self.manifest = root / "sandbox.json"
+        self.env = GIT_ENV.copy()
 
     @classmethod
     def open(cls, path):
@@ -46,27 +49,45 @@ class Sandbox:
     def save(self, name, value):
         (self.evidence / name).write_text(json.dumps(value, indent=2) + "\n")
 
-    def command(self, *args, cwd=None, allowed=(0,)):
+    def command(self, *args, cwd=None, allowed=(0,), while_running=None):
         argv = list(map(str, args))
         cwd = cwd or self.repo
-        result = subprocess.run(argv, cwd=cwd, env=GIT_ENV, capture_output=True,
-                                text=True, timeout=30)
-        with (self.evidence / "commands.jsonl").open("a") as log:
-            log.write(json.dumps({"cwd": str(cwd), "argv": argv,
-                                  "command": shlex.join(argv), "exit_code": result.returncode,
-                                  "stdout": result.stdout, "stderr": result.stderr}) + "\n")
+        if while_running is None:
+            result = subprocess.run(argv, cwd=cwd, env=self.env, capture_output=True,
+                                    text=True, timeout=30)
+            self.log_command(result, cwd)
+        else:
+            with subprocess.Popen(argv, cwd=cwd, env=self.env, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True) as process:
+                try:
+                    while_running(process)
+                    stdout, stderr = process.communicate(timeout=10)
+                except BaseException:
+                    process.kill()
+                    stdout, stderr = process.communicate()
+                    raise
+                finally:
+                    result = subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+                    self.log_command(result, cwd)
         if result.returncode not in allowed:
             raise RuntimeError(f"{shlex.join(argv)} exited {result.returncode}: {result.stderr.strip()}")
         return result
 
+    def log_command(self, result, cwd):
+        argv = result.args
+        with (self.evidence / "commands.jsonl").open("a") as log:
+            log.write(json.dumps({"cwd": str(cwd), "argv": argv,
+                                  "command": shlex.join(argv), "exit_code": result.returncode,
+                                  "stdout": result.stdout, "stderr": result.stderr}) + "\n")
+
     def git(self, *args, **kwargs):
         return self.command("git", "-c", "core.hooksPath=/dev/null", *args, **kwargs).stdout
 
-    def team(self, *args, cwd=None):
-        return json.loads(self.command(PYTHON, SCRIPT, "--db", self.db, *args, cwd=cwd).stdout)
+    def team(self, *args, **kwargs):
+        return json.loads(self.command(PYTHON, SCRIPT, "--db", self.db, *args, **kwargs).stdout)
 
-    def probe(self, *args):
-        result = self.command(PYTHON, SCRIPT, "--db", self.db, *args, allowed=(0, 1))
+    def probe(self, *args, **kwargs):
+        result = self.command(PYTHON, SCRIPT, "--db", self.db, *args, allowed=(0, 1), **kwargs)
         if result.returncode:
             return {"exit_code": result.returncode, "error": result.stderr.strip()}
         return {"exit_code": 0, "result": json.loads(result.stdout)}
@@ -373,12 +394,381 @@ def review_main(box, run):
     return {"same_session_main_review_delivered": completed, "main_checkout_patch_preserved": True}
 
 
+def report_done(box, run, dispatch, turn=1):
+    box.git("ls-files", "--error-unmatch", FILE, cwd=box.worker)
+    box.done(dispatch, turn, f"Verified {FILE}", f"git ls-files --error-unmatch {FILE}")
+    require(box.wake(run, "done")["dispatch_id"] == dispatch, "completion must identify the Dispatch")
+    require(box.end(dispatch, turn)["outcome"] == "success", "the Dispatch must finish successfully")
+
+
+def fake_github(box, number):
+    fixture = box.root / "github.json"
+    executable = box.root / "gh"
+    executable.write_text(f"#!{PYTHON}\n" + """import json
+import sys
+from pathlib import Path
+
+fixture = Path(__file__).with_name("github.json")
+state = json.loads(fixture.read_text())
+args = sys.argv[1:]
+with fixture.with_name("gh-calls.jsonl").open("a") as log:
+    print(json.dumps(args), file=log)
+number = str(state["number"])
+remote = state["remote"]
+if len(args) == 5 and args[:4] == ["pr", "view", number, "--json"]:
+    print(json.dumps(remote))
+elif args == ["pr", "merge", number, "--disable-auto"]:
+    remote["autoMergeRequest"] = None
+    fixture.write_text(json.dumps(state))
+elif args == ["pr", "merge", number, "--auto", "--squash", "--match-head-commit", remote["headRefOid"]]:
+    remote["autoMergeRequest"] = {"enabled": True}
+    fixture.write_text(json.dumps(state))
+else:
+    sys.exit(f"Unexpected fake gh command: {args!r}")
+""")
+    executable.chmod(0o700)
+    box.env["PATH"] = str(box.root) + os.pathsep + box.env.get("PATH", os.defpath)
+    box.env["TEAM_UP_GH"] = str(executable)
+    remote = {
+        "headRefOid": box.git("rev-parse", "worker").strip(),
+        "statusCheckRollup": [{"name": "verify", "conclusion": "SUCCESS"}],
+        "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+        "autoMergeRequest": None, "state": "OPEN", "mergeCommit": None,
+        "files": [{"path": FILE, "changeType": "MODIFIED"}], "changedFiles": 1,
+        "url": f"https://example.invalid/pull/{number}", "baseRefName": "main",
+    }
+    fixture.write_text(json.dumps({"number": number, "remote": remote}))
+    return fixture
+
+
+def remote_update(fixture, **changes):
+    state = json.loads(fixture.read_text())
+    state["remote"].update(changes)
+    fixture.write_text(json.dumps(state))
+
+
+def board(box, run):
+    done = box.task(run, "Already delivered")
+    task = box.task(run, "Fix a failed PR")
+    queued = box.task(run, "Ready task")
+    gated = box.task(run, "Needs a decision", "--gate", "release")
+    blocked = box.task(run, "Waits for release", "--after-merge", task)
+    first = box.reserve(run, done)["id"]
+    box.start(first, 1)
+    report_done(box, run, first)
+    box.team("delivered", first)
+    dispatch = box.reserve(run, task)["id"]
+    box.start(dispatch, 1)
+    report_done(box, run, dispatch)
+    review = box.team("board", run, "--json")
+    box.team("delivered", dispatch)
+    fixture = fake_github(box, 42)
+    box.team("pr-open", dispatch, "--number", 42)
+    remote_update(fixture, statusCheckRollup=[{"name": "verify", "conclusion": "FAILURE"}])
+    box.team("pr-sync", run)
+    merging = box.team("board", run, "--json")
+    page = box.root / "slots.html"
+    box.team("board", run, "--html", page)
+    idle = page.read_text()
+    before = box.team("status", run)
+    box.team("instruct", dispatch, "Fix the failing verify check")
+    resumed = box.start(dispatch, 2)
+    expected_state = box.team("status", run)
+    current = box.team("board", run, "--json")
+    plain = box.command(PYTHON, SCRIPT, "--db", box.db, "board", run).stdout
+    box.team("board", run, "--html", page)
+    fixing = page.read_text()
+    denied = box.team("reserve", run, "--task", queued)
+    box.save("board-snapshots.json", {"review": review, "merging": merging, "fixing": current, "queued": denied})
+    (box.evidence / "board.txt").write_text(plain)
+    (box.evidence / "board-idle.html").write_text(idle)
+    (box.evidence / "board-fixing.html").write_text(fixing)
+
+    groups = {
+        group["key"]: [item["task_id"] for item in group["tasks"]]
+        for group in current["groups"]
+    }
+    sections = [(group["title"], group["count"]) for group in current["groups"] if group["tasks"]]
+    headings = [line for line in plain.splitlines() if line and not line.startswith(" ")]
+    return {
+        "review_then_merge_then_fix": board_tasks(review, "review") == [task]
+        and board_tasks(merging, "merging") == [task]
+        and groups["in_progress"] == [task, queued],
+        "one_group_per_task": groups == {
+            "needs_user": [gated], "in_progress": [task, queued], "review": [],
+            "merging": [], "blocked": [blocked], "done": [done],
+        },
+        "text_matches_json": headings == [f"{title} ({count})" for title, count in sections]
+        and all(f"  #{task_id} codex " in plain for task_id in (task, queued, gated, blocked, done))
+        and "대기열" in plain and f"← #{task}" in plain,
+        "fix_turn_occupies_slot": resumed["session"] == f"fixture:{dispatch}"
+        and before["pull_requests"][0]["fix_rounds"] == 0
+        and expected_state["pull_requests"][0]["fix_rounds"] == 1
+        and '<span class="count">0/1</span>' in idle
+        and '<span class="count">1/1</span>' in fixing and denied is None,
+        "board_is_read_only": box.team("status", run) == expected_state,
+    }
+
+
+def board_tasks(snapshot, key):
+    return [item["task_id"] for group in snapshot["groups"] if group["key"] == key for item in group["tasks"]]
+
+
+def run_notes(box, run):
+    task = box.task(run, "Read shared conventions")
+    first = box.team("note", run, "Keep the README heading")
+    dispatch = box.reserve(run, task)["id"]
+    initial = box.start(dispatch, 1)
+    second = box.team("note", run, "Use the latest wording")
+    active = box.team("status", run)
+    box.team("record", dispatch, "--turn", 1, "Can I continue?", cwd=box.worker)
+    question = box.wake(run, "question")["data"]["message_id"]
+    box.end(dispatch, 1)
+    box.team("answer", question, "Continue with the latest note")
+    resumed = box.start(dispatch, 2)
+    oversized = "한글" * 2200
+    third = box.team("note", run, oversized)
+    report_done(box, run, dispatch, 2)
+    box.team("delivered", dispatch)
+    other = box.run("Independent notes scope")
+    other_task = box.task(other, "Read another Run's conventions")
+    other_note = box.team("note", other, "Other run only")
+    other_dispatch = box.reserve(other, other_task)["id"]
+    isolated = box.start(other_dispatch, 1)
+    report_done(box, other, other_dispatch)
+    box.team("delivered", other_dispatch)
+    latest_task = box.task(run, "Read the truncated brief")
+    latest = box.start(box.reserve(run, latest_task)["id"], 1)
+    stored = box.team("status", run)
+    box.save("notes-briefs.json", {"initial": initial, "resumed": resumed, "latest": latest,
+                                  "isolated": isolated, "active": active})
+    prefix, _, marker = latest["notes"].rpartition("\n")
+    return {
+        "notes_version_advances_per_run": [first["notes_version"], second["notes_version"],
+                                           third["notes_version"], other_note["notes_version"]] == [1, 2, 3, 1]
+        and active["dispatches"][0]["notes_version"] == 1 and stored["run"]["notes_version"] == 3,
+        "next_turn_gets_latest_first": initial["notes"] == first["text"]
+        and resumed["notes"] == f"{second['text']}\n\n{first['text']}"
+        and resumed["notes_version"] == 2,
+        "notes_are_run_scoped": isolated["notes"] == other_note["text"],
+        "brief_truncated_but_status_keeps_full_notes": bool(prefix) and oversized.startswith(prefix)
+        and marker == "[Run notes truncated]" and len(latest["notes"].encode()) <= 4096
+        and [note["text"] for note in stored["notes"]] == [first["text"], second["text"], oversized],
+    }
+
+
+def worker_progress(box, run):
+    task = box.task(run, "Report fixture edits")
+    dispatch = box.reserve(run, task)["id"]
+    box.start(dispatch, 1)
+
+    def snapshot():
+        result = box.team("board", run, "--json")
+        running = [item for group in result["groups"] if group["key"] == "in_progress"
+                   for item in group["tasks"] if item["task_id"] == task]
+        require(len(running) == 1, "the progress Task must appear once under in progress")
+        return running[0]
+
+    initial = snapshot()
+    report = box.team("progress", dispatch, "--turn", 1, "--step", "2/4", "Editing fixture", cwd=box.worker)
+    update = box.team("progress", dispatch, "--turn", 1, "Reviewing fixture", cwd=box.worker)
+    stale_turn = box.probe("progress", dispatch, "--turn", 2, "Wrong turn", cwd=box.worker)
+    tracked = box.worker / FILE
+    _, _, remaining = tracked.read_text().partition("\n")
+    tracked.write_text("Progress fixture heading\nProgress fixture detail\n" + remaining)
+    (box.worker / "progress-untracked.txt").write_text("one\ntwo\n")
+    (box.worker / "progress-binary").write_bytes(b"\x00\xff")
+    active = snapshot()
+    old = "2000-01-01T00:00:00+00:00"
+    with closing(sqlite3.connect(box.db)) as db, db:
+        db.execute("UPDATE dispatches SET heartbeat_at = ?, progress_at = ? WHERE id = ?", (old, old, dispatch))
+    stalled = snapshot()
+    plain = box.command(PYTHON, SCRIPT, "--db", box.db, "board", run).stdout
+    heartbeat = box.team("heartbeat", dispatch, "--turn", 1, cwd=box.worker)
+    recovered = snapshot()
+    box.save("progress-snapshots.json", {"initial": initial, "report": report, "active": active,
+                                         "stalled": stalled, "recovered": recovered, "stale_turn": stale_turn})
+    (box.evidence / "progress-stalled.txt").write_text(plain)
+    return {
+        "optional_step_and_current_turn": all(initial[key] is None for key in
+                                             ("progress_text", "progress_step", "progress_total", "progress_at"))
+        and (report["progress_step"], report["progress_total"]) == (2, 4)
+        and (active["progress_step"], active["progress_total"], active["progress_text"]) == (2, 4, "Reviewing fixture")
+        and active["last_update_at"] == update["progress_at"] and stale_turn["exit_code"] == 1
+        and "2/4 단계" in plain and "Reviewing fixture" in plain,
+        "diff_stats_include_untracked_and_binary": active["diff_stats"] == {"files": 3, "added": 4, "deleted": 1}
+        and "3개 파일 +4 -1" in plain,
+        "stalls_and_recovers": active["stalled"] is False and stalled["stalled"] is True
+        and stalled["last_update_at"] == old and "⚠ 정체" in plain
+        and recovered["stalled"] is False and recovered["last_update_at"] == heartbeat["heartbeat_at"],
+    }
+
+
+def html_board(box, run):
+    task = box.task(run, "Show <fixture> safely")
+    dispatch = box.reserve(run, task)["id"]
+    box.start(dispatch, 1)
+    single = box.team("board", run, "--html")
+    default = box.root / "boards" / f"run-{run}.html"
+    one_shot = default.read_text()
+    path = box.root / "watch.html"
+    refresh = '<meta http-equiv="refresh" content="1">'
+
+    def finish_run(process):
+        deadline = time.monotonic() + 10
+        while not path.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        require(path.is_file(), "watch must write its first page before the Run finishes")
+        active = path.read_text()
+        (box.evidence / "html-live.html").write_text(active)
+        report_done(box, run, dispatch)
+        box.team("delivered", dispatch)
+
+    watch = box.team("board", run, "--html", path, "--watch", 1, while_running=finish_run)
+    live = (box.evidence / "html-live.html").read_text()
+    final = path.read_text()
+    (box.evidence / "html-default.html").write_text(one_shot)
+    (box.evidence / "html-final.html").write_text(final)
+    return {
+        "one_shot_uses_database_directory": single == {"path": str(default), "finished": False}
+        and "Show &lt;fixture&gt; safely" in one_shot,
+        "active_watch_refreshes": refresh in live and '<span class="count">1/1</span>' in live
+        and "전달됨" not in live,
+        "finished_watch_exits_and_leaves_final_page": watch == {"path": str(path), "finished": True}
+        and 'http-equiv="refresh"' not in final and "전달됨" in final
+        and '<span class="count">0/1</span>' in final and "Show &lt;fixture&gt; safely" in final,
+    }
+
+
+def pr_follow_up(box, run):
+    number = 42
+    task = box.task(run, "Deliver a PR for monitoring")
+    dependent = box.task(run, "Ready after the PR merges", "--after-merge", task, "--gate", "rollout")
+    dispatch = box.reserve(run, task)["id"]
+    box.start(dispatch, 1)
+    report_done(box, run, dispatch)
+    box.team("delivered", dispatch)
+    fixture = fake_github(box, number)
+    remote_update(fixture, autoMergeRequest={"enabled": True})
+    opened = box.team("pr-open", dispatch, "--number", number)
+    held_arm = box.probe("pr-arm", task)
+    gate = f"merge-pr-{number}"
+    unapproved = box.probe("pr-policy", task, "auto", "--gate", gate)
+    box.team("gate", run, "rollout", "--decision", "approve")
+    attached = box.probe("pr-policy", task, "auto", "--gate", "rollout")
+    box.team("gate", run, gate, "--decision", "approve")
+    automatic = box.team("pr-policy", task, "auto", "--gate", gate)
+    armed = box.team("pr-arm", task)
+    passed = box.team("wait", run, "--timeout", 0)
+    box.team("ack", run, passed["cursor"])
+    remote_update(fixture, statusCheckRollup=[{"name": "verify", "conclusion": "FAILURE"}])
+    failed = box.team("wait", run, "--sync-prs", 1, "--timeout", 2)
+    box.team("ack", run, failed["cursor"])
+    blocked = box.team("reserve", run, "--task", dependent)
+    remote_update(fixture, state="MERGED", mergeCommit={"oid": armed["head_sha"]}, autoMergeRequest=None)
+    synced = box.team("pr-sync", run)["pull_requests"][0]
+    merged = box.team("wait", run, "--timeout", 0)
+    available = box.team("reserve", run, "--task", dependent)
+    calls = [json.loads(line) for line in (box.root / "gh-calls.jsonl").read_text().splitlines()]
+    box.save("gh-calls.json", calls)
+    box.save("pr-probes.json", {"opened": opened, "held_arm": held_arm, "unapproved": unapproved,
+                                 "attached_gate": attached, "automatic": automatic, "armed": armed,
+                                 "passed": passed, "failed": failed, "synced": synced, "merged": merged,
+                                 "blocked": blocked, "available": available})
+    return {
+        "default_hold_disarms_and_refuses_arm": opened["number"] == number and opened["policy"] == "hold"
+        and opened["auto_merge"] == 0 and "requires auto" in held_arm.get("error", ""),
+        "auto_requires_dedicated_approved_gate": "approved gate" in unapproved.get("error", "")
+        and "dedicated PR gate" in attached.get("error", "")
+        and automatic["policy"] == "auto" and automatic["approval_gate"] == gate and automatic["auto_merge"] == 0,
+        "arm_uses_observed_head": armed["auto_merge"] == 1
+        and [call for call in calls if call[:2] == ["pr", "merge"]] == [
+            ["pr", "merge", str(number), "--disable-auto"],
+            ["pr", "merge", str(number), "--auto", "--squash", "--match-head-commit", armed["head_sha"]],
+        ],
+        "wait_sync_reports_failure": [event["kind"] for event in passed["events"]] == ["pr-checks-passed"]
+        and [event["kind"] for event in failed["events"]] == ["pr-checks-failed"]
+        and failed["events"][0]["task_id"] == task,
+        "sync_records_merge_and_unblocks_dependent": synced["state"] == "MERGED"
+        and synced["merged_commit"] == armed["head_sha"]
+        and [event["kind"] for event in merged["events"]] == ["pr-merged"]
+        and blocked is None and available is not None and available["task_id"] == dependent,
+    }
+
+
+def migrate_v4(box, run):
+    legacy_script = box.root / "team_up_v4.py"
+    legacy_script.write_text(box.git("show", f"{V4_REVISION}:{SCRIPT.relative_to(SOURCE)}"))
+    legacy_db = box.root / "legacy.db"
+
+    def legacy(*args, cwd=None):
+        return json.loads(box.command(PYTHON, legacy_script, "--db", legacy_db, *args, cwd=cwd).stdout)
+
+    legacy_init = legacy("init")
+    old_run = legacy("run-create", "--goal", "Preserve this v4 run", "--slots", 1, "--base", "main")["id"]
+    task = legacy("task-create", old_run, "--worker", "codex", "--goal", "Preserve this task",
+                  "--scope", "read-only", "--evidence", "Full result")["id"]
+    dispatch = legacy("reserve", old_run, "--task", task, "--worktree", box.worker, "--branch", "worker")["id"]
+    session = f"v4-fixture:{dispatch}"
+    legacy("begin", dispatch)
+    legacy("started", dispatch, "--turn", 1, "--runtime", session, "--session", session)
+    question = legacy("record", dispatch, "--turn", 1, "Keep this question?", cwd=box.worker)["id"]
+    legacy("turn-ended", dispatch, "--turn", 1)
+    legacy("exited", dispatch, "--turn", 1, "--code", 0)
+    before = legacy("status", old_run)
+
+    def migrated(*args, **kwargs):
+        return box.command(PYTHON, SCRIPT, "--db", legacy_db, *args, **kwargs)
+
+    denied = migrated("status", old_run, allowed=(0, 1))
+    init = json.loads(migrated("init").stdout)
+    after = json.loads(migrated("status", old_run).stdout)
+    note = json.loads(migrated("note", old_run, "A v5 note on the preserved Run").stdout)
+    migrated("answer", question, "Yes")
+    resumed = json.loads(migrated("begin", dispatch).stdout)
+    before_repeat = json.loads(migrated("status", old_run).stdout)
+    repeated = json.loads(migrated("init").stdout)
+    after_repeat = json.loads(migrated("status", old_run).stdout)
+    with closing(sqlite3.connect(f"{legacy_db.as_uri()}?mode=ro", uri=True)) as db:
+        integrity = db.execute("PRAGMA integrity_check").fetchall()
+        foreign_keys = db.execute("PRAGMA foreign_key_check").fetchall()
+    box.save("migration.json", {"legacy_init": legacy_init, "before": before, "after": after,
+                                 "init": init, "repeat_init": repeated, "resumed": resumed,
+                                 "before_repeat": before_repeat, "after_repeat": after_repeat,
+                                 "integrity": integrity, "foreign_keys": foreign_keys})
+    preserved = all(
+        [{key: row[key] for key in old} for row, old in zip(after[table], before[table])] == before[table]
+        and len(after[table]) == len(before[table])
+        for table in ("tasks", "dispatches", "messages", "gates", "dependencies", "task_gates")
+    )
+    return {
+        "init_required_for_v4": legacy_init["schema_version"] == 4 and denied.returncode == 1
+        and "run init" in denied.stderr,
+        "in_place_v5_upgrade_is_idempotent": init["schema_version"] == 5 and init["db"] == legacy_init["db"]
+        and init == repeated and before_repeat == after_repeat and integrity == [("ok",)] and foreign_keys == [],
+        "v4_history_and_v5_defaults": preserved
+        and {key: after["run"][key] for key in before["run"]} == before["run"]
+        and after["run"]["notes_version"] == 0 and after["notes"] == [] and after["pull_requests"] == []
+        and all(after["dispatches"][0][key] is None for key in
+                ("notes_version", "progress_text", "progress_step", "progress_total", "progress_at")),
+        "v4_dispatch_resumes_with_v5_note": resumed["id"] == dispatch and resumed["session"] == session
+        and resumed["turn"] == 2 and resumed["notes"] == note["text"]
+        and resumed["notes_version"] == 1 and resumed["messages"][0]["answer"] == "Yes",
+    }
+
+
 JOURNEYS = {
     "lifecycle": (lifecycle, 1),
     "questions": (questions, 1),
     "gate": (gate, 2),
     "instructions": (instructions, 1),
     "review-main": (review_main, 1),
+    "board": (board, 1),
+    "run-notes": (run_notes, 1),
+    "progress": (worker_progress, 1),
+    "board-html": (html_board, 1),
+    "pr-follow-up": (pr_follow_up, 1),
+    "migration-v5": (migrate_v4, 1),
 }
 
 

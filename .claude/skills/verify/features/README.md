@@ -11,6 +11,12 @@ Use one entry per user-facing journey. Follow the baseline in [verify](../SKILL.
 | 3 | [Decision gate and merge dependency](gate.md) | `gate` |
 | 4 | [Coordinator instructions and follow-up](instructions.md) | `instructions` |
 | 5 | [Review changes in the main checkout](review-main.md) | `review-main` |
+| 6 | [Run board and fix-turn occupancy](board.md) | `board` |
+| 7 | [Run notes](run-notes.md) | `run-notes` |
+| 8 | [Worker progress and stalled status](progress.md) | `progress` |
+| 9 | [HTML board and watch](board-html.md) | `board-html` |
+| 10 | [Pull request follow-up](pr-follow-up.md) | `pr-follow-up` |
+| 11 | [Upgrade a v4 database](migration-v5.md) | `migration-v5` |
 
 ## Driving conventions
 
