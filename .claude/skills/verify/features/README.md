@@ -1,6 +1,6 @@
 # Team-up verification map
 
-Use one entry per user-facing journey. Follow the baseline in [verify-team-up](../SKILL.md) and run doctor before each drive.
+Use one entry per user-facing journey. Follow the baseline in [verify](../SKILL.md) and run doctor before each drive.
 
 ## Features
 

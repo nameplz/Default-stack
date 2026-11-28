@@ -1,5 +1,5 @@
 ---
-name: verify-team-up
+name: verify
 description: Verify the team-up coordinator and worker CLI in a disposable Git repository. Use for team-up behavior changes, lifecycle regressions, or reports about dispatch, gates, resume, delivery, and cleanup.
 ---
 
@@ -12,7 +12,7 @@ Use the real [team-up CLI](../../../plugin/skills/team-up/scripts/team_up.py) an
 Run from the repository root in a POSIX shell. The helper uses Git and Python 3. The default verification interpreter is `/usr/bin/python3`. If it is unavailable or the CLI warns about SQLite, set `VERIFY_TEAM_UP_PYTHON` to an absolute path to a Python with the SQLite fix required by the guide.
 
 ```sh
-helper=.claude/skills/verify-team-up/scripts/sandbox.py
+helper=.claude/skills/verify/scripts/sandbox.py
 evidence=$(mktemp -d /tmp/verify-team-up-evidence.XXXXXX)
 sandbox=$("$helper" launch "$evidence")
 ```
