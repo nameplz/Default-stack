@@ -180,7 +180,6 @@ class TeamUpTest(unittest.TestCase):
         )["id"]
 
     def make_legacy_agy(self, task):
-        # Restore the historical worker identity after creating the lifecycle state.
         with closing(sqlite3.connect(self.db)) as db, db:
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)
             db.execute("UPDATE tasks SET worker = 'agy' WHERE id = ?", (task,))

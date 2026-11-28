@@ -32,7 +32,6 @@ PR_VIEW_FIELDS = ("headRefOid,statusCheckRollup,mergeable,mergeStateStatus,autoM
                   "state,mergeCommit,files,url,baseRefName,changedFiles")
 WAKE_EVENTS = ("question", "done", "pr-checks-failed", "pr-conflict")
 PR_INFO_EVENTS = ("pr-checks-passed", "pr-behind", "pr-merged", "pr-closed", "pr-policy-downgraded")
-# Keep agy for historical records; ACTIVE_WORKERS governs new work.
 TASKS_SCHEMA = """CREATE TABLE {} (
     id INTEGER PRIMARY KEY,
     run_id INTEGER NOT NULL REFERENCES runs(id),
@@ -1453,7 +1452,8 @@ def worktree_diff_stats(worktree):
             if not record:
                 break
             additions, deletions, path = record.split("\t", 2)
-            if not path:  # A rename has its old and new paths in the next two fields.
+            renamed_with_old_and_new_paths_next = not path
+            if renamed_with_old_and_new_paths_next:
                 next(records)
                 next(records)
             files += 1
