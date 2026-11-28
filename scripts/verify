@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")/.."
+exec "${VERIFY_PYTHON:-/usr/bin/python3}" scripts/checks.py "$@"

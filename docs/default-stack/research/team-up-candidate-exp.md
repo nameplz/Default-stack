@@ -114,7 +114,7 @@ Codex CLI 0.170.0의 `codex exec --help`는 `read-only`를 셸 샌드박스 모�
 
 Claude Code 2.1.330의 `claude --help`에서 인라인 `--settings`, `--restricted`, `--tools`, `--resume`을 확인했다. Bash 샌드박스는 체크아웃과 Git common dir의 쓰기를 차단하고 상태 디렉터리의 쓰기를 허용한다. 도구 목록에서 편집 도구를 제외한다. OS 제한 구현은 Anthropic의 Apache-2.0 sandbox-runtime을 참고했다. 실행에 새 의존성을 추가하지 않았다. [Claude 샌드박스 설정](https://code.claude.com/docs/en/sandboxing) [sandbox-runtime 소스와 라이선스](https://github.com/anthropics/sandbox-runtime)
 
-`verify-team-up`의 `review-main`은 셸 역할로 같은 Dispatch와 세션 ID의 재개, DB 쓰기, 리뷰 전달, 패치 일치를 확인했다. 호스트별 샌드박스의 실제 쓰기 차단과 모델 세션 재개는 이번에 실동작으로 검증하지 않았다.
+`verify` 스킬의 `review-main`은 셸 역할로 같은 Dispatch와 세션 ID의 재개, DB 쓰기, 리뷰 전달, 패치 일치를 확인했다. 호스트별 샌드박스의 실제 쓰기 차단과 모델 세션 재개는 이번에 실동작으로 검증하지 않았다.
 
 네 번째 실동작 검증(2026-11-21, Codex CLI 0.170.0, Claude Code `--model haiku`)에서는 가이드의 `codex_review`와 `claude_review` 배열 그대로 두 워커를 실행했다. 임시 저장소의 미커밋 `calc.py` 버그를 리뷰했고 상태 디렉터리는 체크아웃 밖에 두었다. Run 하나, 슬롯 1에서 Codex 리뷰 Dispatch 뒤 Claude 리뷰 Dispatch를 진행했다. 각 첫 턴은 Status·Diff 확인, 체크아웃 쓰기 시도 한 번, 질문 `record`였다. 코디네이터가 `answer`하고 `begin`으로 두 번째 턴을 열었으며, 워커는 Diff를 다시 실행하고 `changed_code: false`로 `done`을 기록했다.
 
