@@ -277,6 +277,10 @@ If the current turn has no runtime handle, `turn-ended` and `exited` warn on std
 
 If worker activity is still expected in the Claude desktop app's Code tab, start `wait <run-id> --timeout 30` as a background Bash job and end the turn. The job's completion wakes the coordinator. In an active CLI coordinator, poll with `wait <run-id> --timeout 30` and reconcile after each return. If the CLI coordinator exits, resume its saved session and name the absolute DB path and Run ID in the prompt. Use `claude -p --resume <coordinator-session-id>` for Claude Code CLI. For Codex CLI, follow the [Codex coordinator pickup procedure](#codex-coordinator). For agy, follow the [agy coordinator pickup procedure](#agy-coordinator).
 
+## Report progress with the board
+
+When you report progress to the user, run `board <run-id>` and show its output as is. It is read-only and places each Task in one group: 내 차례 (unanswered questions, undecided gates, three start failures), 진행 중 (open Dispatches and ready Tasks marked 대기열), 검토 대기, 머지 중, 막힘 (with `←` naming what the Task waits on), and 완료. Lead with the 내 차례 items. Use `board <run-id> --json` when you need the same groups as data, and `status` when you need the raw records.
+
 ## Stop or retry
 
 - Treat an overdue heartbeat as a prompt to inspect the saved handle and start identity. Check the host or supervisor for current liveness. Keep the slot and worktree reserved while liveness is unknown.

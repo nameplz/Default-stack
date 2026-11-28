@@ -943,6 +943,84 @@ class TeamUpTest(unittest.TestCase):
         self.invoke("ack", run, replayed["cursor"])
         self.assertEqual(self.invoke("wait", run, "--timeout", 0), {"events": [], "cursor": replayed["cursor"]})
 
+    def build_board_run(self):
+        run = self.run_create(20)
+        ids = {}
+        ids["ask"] = self.task(run, "Ask the user")
+        dispatch, turn = self.start(run, ids["ask"])
+        self.invoke("record", dispatch, "--turn", turn, "Permission denied: Bash git push")
+        ids["gate"] = self.task(run, "Wait for design gate", "--gate", "design")
+        ids["breaker"] = self.task(run, "Fails to start")
+        dispatch = self.invoke("reserve", run, "--task", ids["breaker"])["id"]
+        for attempt in range(3):
+            self.exit_worker(dispatch, self.begin(dispatch), "--start-failed", code=1)
+            if attempt < 2:
+                dispatch = self.invoke("retry", dispatch)["id"]
+        ids["running"] = self.task(run, "Keep working")
+        self.start(run, ids["running"])
+        ids["ready"] = self.task(run, "Ready to go")
+        ids["review"] = self.task(run, "Needs review", worker="claude")
+        dispatch, turn = self.start(run, ids["review"])
+        self.report(dispatch, turn)
+        self.exit_worker(dispatch, turn)
+        ids["merging"] = self.task(run, "Delivered awaiting merge")
+        dispatch, turn = self.start(run, ids["merging"])
+        self.report(dispatch, turn)
+        self.exit_worker(dispatch, turn)
+        self.invoke("delivered", dispatch)
+        ids["after_merge"] = self.task(run, "Needs the merge", "--after-merge", ids["merging"])
+        ids["after"] = self.task(run, "Needs running task", "--after", ids["running"])
+        ids["rejected"] = self.task(run, "Rejected gate", "--gate", "qa")
+        self.invoke("gate", run, "qa", "--decision", "reject")
+        ids["abandoned"] = self.task(run, "Given up")
+        dispatch = self.invoke("reserve", run, "--task", ids["abandoned"])["id"]
+        self.invoke("abandon", dispatch, "--reason", "Out of scope")
+        ids["delivered"] = self.task(run, "Shipped")
+        dispatch, turn = self.start(run, ids["delivered"])
+        self.report(dispatch, turn)
+        self.exit_worker(dispatch, turn)
+        self.invoke("delivered", dispatch)
+        return run, ids
+
+    def test_board_groups_each_task_once_from_the_users_view(self):
+        run, ids = self.build_board_run()
+        with sqlite3.connect(self.db) as db:
+            before = list(db.iterdump())
+        board = self.invoke("board", run, "--json")
+        with sqlite3.connect(self.db) as db:
+            self.assertEqual(list(db.iterdump()), before)
+        groups = {group["key"]: {task["task_id"]: task["fact"] for task in group["tasks"]}
+                  for group in board["groups"]}
+        self.assertEqual([group["key"] for group in board["groups"]],
+                         ["needs_user", "in_progress", "review", "merging", "blocked", "done"])
+        self.assertEqual(groups["needs_user"], {
+            ids["ask"]: "Permission denied: Bash git push",
+            ids["gate"]: "gate design",
+            ids["breaker"]: "시작 실패 3회 · retry --override",
+        })
+        self.assertEqual(set(groups["in_progress"]), {ids["running"], ids["ready"]})
+        self.assertEqual(groups["in_progress"][ids["ready"]], "대기열")
+        self.assertRegex(groups["in_progress"][ids["running"]], r"^\d+(초|분)$")
+        self.assertEqual(list(groups["review"]), [ids["review"]])
+        self.assertEqual(groups["merging"], {ids["merging"]: f"→ #{ids['after_merge']}"})
+        self.assertEqual(groups["blocked"], {
+            ids["after_merge"]: f"← #{ids['merging']} 머지",
+            ids["after"]: f"← #{ids['running']}",
+            ids["rejected"]: "← gate qa",
+        })
+        self.assertEqual(groups["done"], {ids["abandoned"]: "abandoned", ids["delivered"]: "전달됨"})
+        listed = [task for group in groups.values() for task in group]
+        self.assertEqual(sorted(listed), sorted(ids.values()))
+
+    def test_board_text_lists_nonempty_groups_with_counts(self):
+        run = self.run_create()
+        queued = self.task(run, "First line goal\nsecond line")
+        result = subprocess.run([*self.command, "board", str(run)], cwd=self.cwd,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, f"진행 중 (1)\n  #{queued} codex First line goal  대기열\n")
+        self.invoke("board", 99, expected=1)
+
     def test_wait_cursor_preserves_actionable_events_beyond_a_full_batch(self):
         run = self.run_create()
         with sqlite3.connect(self.db) as db:

@@ -914,6 +914,134 @@ def status(db, args):
         return result
 
 
+BOARD_GROUPS = (
+    ("needs_user", "내 차례"),
+    ("in_progress", "진행 중"),
+    ("review", "검토 대기"),
+    ("merging", "머지 중"),
+    ("blocked", "막힘"),
+    ("done", "완료"),
+)
+
+
+def elapsed(since, now):
+    seconds = max(0, int((now - datetime.fromisoformat(since)).total_seconds()))
+    if seconds < 60:
+        return f"{seconds}초"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}분"
+    return f"{minutes // 60}시간 {minutes % 60}분"
+
+
+def short_goal(goal, limit=48):
+    line = goal.strip().splitlines()[0] if goal.strip() else ""
+    return line if len(line) <= limit else line[:limit - 1] + "…"
+
+
+def board_entry(task, dispatches, dependencies, dependents, gates, messages, now):
+    """Return (group, fact, details) for one task; the first matching group wins."""
+    latest = dispatches[-1] if dispatches else None
+    if latest and latest["phase"] != "closed":
+        pending = [m for m in messages.get(latest["id"], ())
+                   if m["kind"] == "question" and m["turn"] == latest["turn"]
+                   and m["answer"] is None and not m["consumed"]]
+        if pending and not latest["stop_requested"]:
+            return "needs_user", pending[0]["text"], {"questions": [{"id": m["id"], "text": m["text"]} for m in pending]}
+        return "in_progress", elapsed(latest["reserved_at"], now), {"phase": latest["phase"]}
+    if latest is None:
+        undecided = [g["name"] for g in gates if g["decision"] is None]
+        if undecided:
+            return "needs_user", f"gate {', '.join(undecided)}", {"gates": undecided}
+        waits = []
+        for dep in dependencies:
+            if not dep["finished"]:
+                waits.append(f"#{dep['prerequisite_id']}")
+            elif dep["condition"] == "merge" and not dep["merged"]:
+                waits.append(f"#{dep['prerequisite_id']} 머지")
+        waits += [f"gate {g['name']}" for g in gates if g["decision"] == "reject"]
+        if task["worker"] not in ACTIVE_WORKERS:
+            waits.append(f"{task['worker']} 비활성")
+        if waits:
+            return "blocked", "← " + ", ".join(waits), {"waits_on": waits}
+        return "in_progress", "대기열", {"queued": True}
+    start_failures = sum(1 for d in dispatches if d["outcome"] == "start-failed")
+    if (latest["outcome"] == "start-failed" and start_failures >= 3
+            and not latest["abandon_reason"] and not latest["taken_over"]):
+        return "needs_user", f"시작 실패 {start_failures}회 · retry --override", {"start_failures": start_failures}
+    succeeded = latest["outcome"] == "success"
+    if succeeded and not latest["delivered"]:
+        return "review", latest["branch"] or f"D{latest['id']}", {}
+    if succeeded and task["merged_commit"] is None:
+        waiting = [f"#{d['task_id']}" for d in dependents if d["condition"] == "merge" and not d["dispatched"]]
+        if waiting:
+            return "merging", "→ " + ", ".join(waiting), {"dependents": waiting}
+    if succeeded:
+        return "done", "머지됨" if task["merged_commit"] else "전달됨", {}
+    return "done", latest["outcome"] or "closed", {"abandon_reason": latest["abandon_reason"]}
+
+
+def board(db, args):
+    now = datetime.now(timezone.utc)
+    with transaction(db, write=False):
+        run_row(db, args.run)
+        tasks = db.execute("SELECT * FROM tasks WHERE run_id = ? ORDER BY id", (args.run,)).fetchall()
+        dispatches, messages, dependencies, dependents, gates = {}, {}, {}, {}, {}
+        for row in db.execute(
+            """SELECT d.* FROM dispatches d JOIN tasks t ON t.id = d.task_id
+            WHERE t.run_id = ? ORDER BY d.task_id, d.attempt""", (args.run,)
+        ):
+            dispatches.setdefault(row["task_id"], []).append(row)
+        for row in db.execute(
+            """SELECT m.* FROM messages m JOIN dispatches d ON d.id = m.dispatch_id
+            JOIN tasks t ON t.id = d.task_id WHERE t.run_id = ? ORDER BY m.id""", (args.run,)
+        ):
+            messages.setdefault(row["dispatch_id"], []).append(row)
+        for row in db.execute(
+            """SELECT dep.*, p.merged_commit IS NOT NULL AS merged,
+                EXISTS (SELECT 1 FROM dispatches d WHERE d.task_id = p.id AND d.outcome = 'success') AS finished,
+                EXISTS (SELECT 1 FROM dispatches d WHERE d.task_id = dep.task_id) AS dispatched
+            FROM dependencies dep JOIN tasks p ON p.id = dep.prerequisite_id
+            WHERE p.run_id = ? ORDER BY dep.task_id, dep.prerequisite_id""", (args.run,)
+        ):
+            dependencies.setdefault(row["task_id"], []).append(row)
+            dependents.setdefault(row["prerequisite_id"], []).append(row)
+        for row in db.execute(
+            """SELECT tg.task_id, g.name, g.decision FROM task_gates tg
+            JOIN gates g ON g.run_id = tg.run_id AND g.name = tg.name
+            WHERE tg.run_id = ? ORDER BY tg.task_id, g.name""", (args.run,)
+        ):
+            gates.setdefault(row["task_id"], []).append(row)
+    groups = {key: [] for key, _ in BOARD_GROUPS}
+    for task in tasks:
+        history = dispatches.get(task["id"], [])
+        group, fact, details = board_entry(
+            task, history, dependencies.get(task["id"], []), dependents.get(task["id"], []),
+            gates.get(task["id"], []), messages, now,
+        )
+        groups[group].append({
+            "task_id": task["id"], "worker": task["worker"], "goal": short_goal(task["goal"]),
+            "dispatch_id": history[-1]["id"] if history else None, "fact": fact, **details,
+        })
+    return {"run_id": args.run, "groups": [
+        {"key": key, "title": title, "count": len(groups[key]), "tasks": groups[key]}
+        for key, title in BOARD_GROUPS
+    ]}
+
+
+def render_board(result):
+    lines = []
+    for group in result["groups"]:
+        if not group["tasks"]:
+            continue
+        if lines:
+            lines.append("")
+        lines.append(f"{group['title']} ({group['count']})")
+        for task in group["tasks"]:
+            lines.append(f"  #{task['task_id']} {task['worker']} {task['goal']}  {task['fact']}")
+    return "\n".join(lines)
+
+
 def flag_dispatch(db, args):
     dispatch = dispatch_row(db, args.dispatch)
     field = {"keep-open": "keep_open", "takeover": "taken_over", "delivered": "delivered"}[args.command]
@@ -1063,6 +1191,7 @@ def parser():
     command("wait", wait, "run", writes=False).add_argument("--timeout", type=duration, default=30)
     command("ack", ack, "run").add_argument("event", type=nonnegative_int)
     command("status", status, "run", writes=False)
+    command("board", board, "run", writes=False).add_argument("--json", action="store_true")
     for name in ("keep-open", "takeover", "delivered"):
         command(name, flag_dispatch, "dispatch")
     command("cleanup", cleanup, "run", writes=False)
@@ -1097,6 +1226,9 @@ def main(argv=None):
             and not getattr(args, "start_failed", False)):
         print(f"team-up: warning: Dispatch {args.dispatch} turn {args.turn} "
               "has no runtime handle recorded with started", file=sys.stderr)
+    if args.command == "board" and not args.json:
+        print(render_board(result))
+        return 0
     print(json.dumps(result, ensure_ascii=False))
     if args.command == "ask" and result["answer"] is None:
         return 124
