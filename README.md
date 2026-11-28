@@ -22,6 +22,30 @@ Every skill runs only when you invoke it. Docs go to existing project docs when 
 
 `apply-stack`, `ship-it`, `formal`, and `explore` read skills from pstack. Install it first: in Claude Code from [cursor/plugins](https://github.com/cursor/plugins/tree/main/pstack) (`/plugin marketplace add cursor/plugins`, then `/plugin install pstack@cursor-plugins`), in Codex and agy from the port [michael-denyer/pstack-claude](https://github.com/michael-denyer/pstack-claude).
 
+Optional: pstack is a Cursor plugin, and some skills its workflows use come from the `cursor-team-kit` plugin instead. They are not bundled for other harnesses. Everything still works without them. To add them, link them from [cursor/plugins](https://github.com/cursor/plugins): Claude Code uses `deslop`, `control-ui`, and `control-cli`, and Codex and agy use `control-ui` and `control-cli`. The commands use the Claude Code marketplace copy if it exists, otherwise a clone at `~/.cursor-plugins`. Run them once; the Claude Code copy updates with `claude plugin marketplace update`, the clone with `git -C ~/.cursor-plugins pull`.
+
+macOS and Linux:
+
+```sh
+root=~/.claude/plugins/marketplaces/cursor-plugins
+[ -d "$root" ] || { root=~/.cursor-plugins; [ -d "$root" ] || git clone https://github.com/cursor/plugins "$root"; }
+src=$root/cursor-team-kit/skills
+mkdir -p ~/.claude/skills ~/.agents/skills
+for s in deslop control-ui control-cli; do ln -sfn "$src/$s" ~/.claude/skills/$s; done
+for s in control-ui control-cli; do ln -sfn "$src/$s" ~/.agents/skills/$s; done
+```
+
+Windows (PowerShell; directory junctions need no administrator rights):
+
+```powershell
+$root = "$HOME\.claude\plugins\marketplaces\cursor-plugins"
+if (-not (Test-Path $root)) { $root = "$HOME\.cursor-plugins"; if (-not (Test-Path $root)) { git clone https://github.com/cursor/plugins $root } }
+$src = "$root\cursor-team-kit\skills"
+New-Item -ItemType Directory -Force "$HOME\.claude\skills", "$HOME\.agents\skills" | Out-Null
+foreach ($s in 'deslop', 'control-ui', 'control-cli') { New-Item -ItemType Junction -Force -Path "$HOME\.claude\skills\$s" -Target "$src\$s" | Out-Null }
+foreach ($s in 'control-ui', 'control-cli') { New-Item -ItemType Junction -Force -Path "$HOME\.agents\skills\$s" -Target "$src\$s" | Out-Null }
+```
+
 Claude Code:
 
 ```
