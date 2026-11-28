@@ -15,7 +15,7 @@ Goal: block repeated mistakes with structure and checks instead of instructions,
 - Bundle the existing checks into one `verify` command in the repository's own task runner. Reuse an equivalent command if one exists. Don't bring in a new tool for a few lines.
 - It must exit non-zero on any violation. Raise warn-only rules that should block to errors.
 - Include runtime checks in `verify` when they are fast. Put slow ones in a separate command such as `verify:ui` and write in the agent rules when to run it.
-- CI runs that one command and nothing else (on GitHub, `.github/workflows/verify.yml`, job name `verify`), on pull requests and pushes to the default branch. Match runtime versions to the local pins.
+- CI runs that one command and nothing else (on GitHub, `.github/workflows/verify.yml`, job name `verify`), on pull requests only. Branch protection requires the branch to be up to date, so a second run after merge would repeat the same check. Match runtime versions to the local pins.
 
 ## 3. Verification skill and feature map
 
