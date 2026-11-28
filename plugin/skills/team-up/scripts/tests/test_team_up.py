@@ -1,8 +1,9 @@
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import closing, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
+from io import StringIO
 from pathlib import Path
 import runpy
 import sqlite3
@@ -1411,7 +1412,7 @@ class TeamUpTest(unittest.TestCase):
         listed = [task for group in groups.values() for task in group]
         self.assertEqual(sorted(listed), sorted(ids.values()))
         path = self.db.parent / "board.html"
-        self.invoke("board", run, "--html", path)
+        self.assertEqual(self.invoke("board", run, "--html", path), {"path": str(path), "finished": False})
         html = path.read_text(encoding="utf-8")
         headings = [f'<h2>{title} <span class="count">{count}</span></h2>'
                     for title, count in (("내 차례", 3), ("진행 중", 2), ("검토 대기", 1),
@@ -1438,7 +1439,7 @@ class TeamUpTest(unittest.TestCase):
         path = directory / "board.html"
         path.write_text("previous board", encoding="utf-8")
         with path.open(encoding="utf-8") as previous:
-            self.assertEqual(self.invoke("board", run, "--html", path), {"path": str(path)})
+            self.assertEqual(self.invoke("board", run, "--html", path), {"path": str(path), "finished": False})
             self.assertEqual(previous.read(), "previous board")
         self.assertEqual(list(directory.iterdir()), [path])
         html = path.read_text(encoding="utf-8")
@@ -1448,38 +1449,100 @@ class TeamUpTest(unittest.TestCase):
         self.assertIn('<meta http-equiv="refresh" content="5">', html)
         self.assertIn('<h2>완료 <span class="count">0</span></h2>\n</section>', html)
 
+    def test_board_html_default_path_and_finished_detection(self):
+        run = self.run_create()
+        path = self.db.resolve().parent / "boards" / f"run-{run}.html"
+        self.assertEqual(self.invoke("board", run, "--html"), {"path": str(path), "finished": False})
+        self.assertIn('<meta http-equiv="refresh" content="5">', path.read_text(encoding="utf-8"))
+
+        dispatch, turn = self.start(run, self.task(run, "Finish the board"))
+        self.assertEqual(self.invoke("board", run, "--html"), {"path": str(path), "finished": False})
+        self.assertIn('<meta http-equiv="refresh" content="5">', path.read_text(encoding="utf-8"))
+
+        self.report(dispatch, turn)
+        self.exit_worker(dispatch, turn)
+        self.invoke("delivered", dispatch)
+        self.assertEqual(self.invoke("board", run, "--html"), {"path": str(path), "finished": True})
+        html = path.read_text(encoding="utf-8")
+        self.assertNotIn('<meta http-equiv="refresh"', html)
+        self.assertIn('<h2>완료 <span class="count">1</span></h2>', html)
+
     def test_board_watch_requires_html_and_a_positive_interval(self):
         path = self.db.parent / "board.html"
         for flags in (("--watch", "1"), ("--json", "--watch", "1"),
-                      ("--json", "--html", path), ("--html", path, "--watch", "0"),
+                      ("--json", "--html"), ("--json", "--html", path), ("--html", path, "--watch", "0"),
                       ("--html", path, "--watch", "-1")):
             with self.subTest(flags=flags):
                 self.invoke("board", 1, *flags, expected=2)
         self.assertFalse(path.exists())
+
+    def test_board_watch_stops_when_all_tasks_are_done(self):
+        run = self.run_create()
+        dispatch, turn = self.start(run, self.task(run, "Finish during the watch"))
+        path = self.db.resolve().parent / "boards" / f"run-{run}.html"
+        main = runpy.run_path(str(SCRIPT))["main"]
+        out = StringIO()
+
+        def sleep(seconds):
+            self.assertIn('<meta http-equiv="refresh" content="3">', path.read_text(encoding="utf-8"))
+            self.report(dispatch, turn)
+            self.exit_worker(dispatch, turn)
+            self.invoke("delivered", dispatch)
+
+        with patch("time.sleep", side_effect=sleep), redirect_stdout(out):
+            code = main(["--db", str(self.db), "board", str(run), "--html", "--watch", "3"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue()), {"path": str(path), "finished": True})
+        html = path.read_text(encoding="utf-8")
+        self.assertNotIn('<meta http-equiv="refresh"', html)
+        self.assertIn('<h2>완료 <span class="count">1</span></h2>', html)
 
     def test_board_watch_reads_fresh_state_and_stops_on_interrupt(self):
         run = self.run_create()
         path = self.db.parent / "board.html"
         main = runpy.run_path(str(SCRIPT))["main"]
         snapshots = []
+        out = StringIO()
 
         def sleep(seconds):
             self.assertEqual(seconds, 3)
             snapshots.append(path.read_text(encoding="utf-8"))
             if len(snapshots) == 2:
+                self.task(run, "Arrived before the interrupt")
                 raise KeyboardInterrupt
             self.task(run, "Arrived during the wait")
             with closing(sqlite3.connect(self.db, timeout=0)) as db:
                 self.assertEqual(db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0], 0)
 
-        with patch("time.sleep", side_effect=sleep):
+        with patch("time.sleep", side_effect=sleep), redirect_stdout(out):
             code = main(["--db", str(self.db), "board", str(run), "--html", str(path), "--watch", "3"])
         self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue()), {"path": str(path), "finished": False})
         self.assertEqual(len(snapshots), 2)
         self.assertNotIn("Arrived during the wait", snapshots[0])
         self.assertIn("Arrived during the wait", snapshots[1])
         for html in snapshots:
             self.assertIn('<meta http-equiv="refresh" content="3">', html)
+        final = path.read_text(encoding="utf-8")
+        self.assertIn("Arrived before the interrupt", final)
+        self.assertNotIn('<meta http-equiv="refresh"', final)
+
+    def test_board_watch_reports_a_failed_interrupt_snapshot(self):
+        run = self.run_create()
+        path = self.db.parent / "board.html"
+        main = runpy.run_path(str(SCRIPT))["main"]
+        out, err = StringIO(), StringIO()
+
+        def sleep(seconds):
+            path.unlink()
+            path.mkdir()
+            raise KeyboardInterrupt
+
+        with patch("time.sleep", side_effect=sleep), redirect_stdout(out), redirect_stderr(err):
+            code = main(["--db", str(self.db), "board", str(run), "--html", str(path), "--watch", "3"])
+        self.assertEqual(code, 1)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn(str(path), err.getvalue())
 
     def test_board_shows_running_progress_and_worktree_diff_stats(self):
         worktree = self.linked_worktree()

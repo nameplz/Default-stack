@@ -1699,13 +1699,16 @@ def render_board_html(result, refresh):
     markup = [
         '<!doctype html>', '<html lang="ko">', '<head>', '<meta charset="utf-8">',
         '<meta name="viewport" content="width=device-width, initial-scale=1">',
-        f'<meta http-equiv="refresh" content="{refresh}">',
+    ]
+    if refresh is not None:
+        markup.append(f'<meta http-equiv="refresh" content="{refresh}">')
+    markup.extend([
         f'<title>Run #{result["run_id"]}</title>',
         f'<style>{BOARD_CSS}</style>', '</head>', '<body>',
         f'<header><h1>Run #{result["run_id"]}</h1>'
         f'<span class="count">{result["occupied"]}/{result["slots"]}</span></header>',
         '<main>',
-    ]
+    ])
     for group in result["groups"]:
         markup.append(f'<section class="{escape(group["key"])}">')
         markup.append(f'<h2>{escape(group["title"])} <span class="count">{group["count"]}</span></h2>')
@@ -1728,14 +1731,32 @@ def write_board_html(path, markup):
             temp.unlink(missing_ok=True)
 
 
-def board_html(db, args):
-    path = args.html.expanduser().absolute()
-    while True:
-        result = board(db, args, include_slots=True)
-        write_board_html(path, render_board_html(result, args.watch or 5))
+def board_finished(result):
+    populated = {group["key"] for group in result["groups"] if group["tasks"]}
+    return populated == {"done"}
+
+
+def board_html(db, args, db_path):
+    if args.html is True:
+        path = db_path.parent / "boards" / f"run-{args.run}.html"
+        path.parent.mkdir(exist_ok=True)
+    else:
+        path = args.html.expanduser().absolute()
+    try:
+        while True:
+            result = board(db, args, include_slots=True)
+            finished = board_finished(result)
+            refresh = None if finished else args.watch or 5
+            write_board_html(path, render_board_html(result, refresh))
+            if finished or args.watch is None:
+                return {"path": str(path), "finished": finished}
+            time.sleep(args.watch)
+    except KeyboardInterrupt:
         if args.watch is None:
-            return {"path": str(path)}
-        time.sleep(args.watch)
+            raise
+        result = board(db, args, include_slots=True)
+        write_board_html(path, render_board_html(result, None))
+        return {"path": str(path), "finished": False}
 
 
 def flag_dispatch(db, args):
@@ -1915,7 +1936,7 @@ def parser():
     board_command = command("board", board, "run", writes=False)
     board_format = board_command.add_mutually_exclusive_group()
     board_format.add_argument("--json", action="store_true")
-    board_format.add_argument("--html", type=Path, metavar="PATH")
+    board_format.add_argument("--html", nargs="?", const=True, type=Path, metavar="PATH")
     board_command.add_argument("--watch", type=positive_int, metavar="SECONDS")
     for name in ("keep-open", "takeover", "delivered"):
         command(name, flag_dispatch, "dispatch")
@@ -1942,7 +1963,7 @@ def main(argv=None):
                 with pr_command_lock(db):
                     result = args.handler(db, args)
             elif html_board:
-                result = board_html(db, args)
+                result = board_html(db, args, path)
             elif args.writes:
                 with transaction(db):
                     result = args.handler(db, args)
@@ -1953,7 +1974,7 @@ def main(argv=None):
                 if warning:
                     result["warning"] = warning
     except KeyboardInterrupt:
-        return 0 if watching_board else 130
+        return 130
     except (StateError, sqlite3.Error, OSError, OverflowError) as exc:
         print(f"team-up: {exc}", file=sys.stderr)
         return 1
