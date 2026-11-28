@@ -10,7 +10,7 @@ apply-stack → ship-it ← team-up, formal, explore
 | Skill | Does |
 |---|---|
 | `coffee-chat` | Casual chat that shapes the idea, written up as docs at the end |
-| `apply-stack` | One-time repo setup: a single verify command, CI, a verification skill, recurring mistakes blocked by checks, auto-merge gated on `verify` |
+| `apply-stack` | One-time repo setup: a single verify command, CI, a verification skill, recurring mistakes blocked by checks, auto-merge gated on `verify` (branch protection is set, with your approval, before the pull request that adds CI) |
 | `ship-it` | Deliver a change as a pull request that merges itself once `verify` passes |
 | `formal` | Formally verify the riskiest property, keep the proof in line with the code, gate merges on it when it runs in about two minutes, otherwise run it on a schedule |
 | `explore` | Drive a release through the feature map and ship a fix PR for each bug reproduced twice, at most 5 per run |
@@ -72,13 +72,29 @@ Run `/default-stack:team-up` in the Claude desktop app's Code tab, the Claude Co
 
 agy worker dispatch is disabled. Google's [Antigravity terms §6](https://antigravity.google/terms) and [FAQ](https://antigravity.google/docs/faq) prohibit third-party agent orchestration with consumer sign-in. team-up does not distinguish authentication types, so it disables agy worker dispatch for all accounts. Existing agy records remain available for inspection, shutdown reconciliation, result delivery, and cleanup; see [existing agy records](plugin/references/team-up.md#existing-agy-records).
 
-Run state uses schema v4. Running `init` upgrades a v3 DB in place (pass the same `--db` if you use a custom path); other commands on a v3 DB ask for `init` first. v2 and older DBs need a new `--db` path; keep the old DB for its Run history.
+What you see and control:
 
-Run the state CLI tests from the repository root:
+| Command | Does |
+|---|---|
+| `board <run>` | Tasks grouped as 내 차례, 진행 중, 검토 대기, 머지 중, 막힘, 완료, with worker progress, worktree diff stats, and stalls after 10 minutes. `--json` for data |
+| `board <run> --html [PATH] [--watch N]` | A self-contained HTML board that refreshes itself. With `--watch`, it rewrites the page every N seconds without the coordinator and leaves a final page when the Run finishes |
+| `progress <dispatch> --turn N [--step k/n] <text>` | A worker reports its plan step. The board updates; the coordinator is not woken |
+| Run notes | Shared notes scoped to one Run, passed to each worker's next turn |
+| `pr-open`, `pr-policy`, `pr-arm`, `pr-sync`, `wait --sync-prs` | Follow up on pull requests after delivery. Policy is `hold` by default; `auto` needs its own approved gate |
+
+Fix turns occupy a worker slot, like first turns.
+
+Run state uses schema v5. Running `init` upgrades a v3 or v4 DB in place (pass the same `--db` if you use a custom path); other commands on an older DB ask for `init` first. v2 and older DBs need a new `--db` path; keep the old DB for its Run history.
+
+## Development
+
+Run the checks CI runs before you call a change done:
 
 ```sh
-python3 -B -m unittest discover -s plugin/skills/team-up/scripts/tests -v
+scripts/verify
 ```
+
+It runs the unit tests and blocks `plugin/` changes without a version bump, links from `plugin/` to files outside it, and new comments. Pull requests to `main` merge only after `verify` passes. The verification skill that drives team-up end to end is in [`.claude/skills/verify/`](.claude/skills/verify/SKILL.md). Agent rules are in [AGENTS.md](AGENTS.md).
 
 ## License
 

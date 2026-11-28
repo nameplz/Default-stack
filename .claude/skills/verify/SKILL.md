@@ -35,9 +35,11 @@ Read the chosen [feature recipe](features/README.md). Start a fresh sandbox and 
 "$helper" drive "$sandbox" lifecycle
 ```
 
-Replace `lifecycle` with `questions`, `gate`, `instructions`, or `review-main` to run that recipe. Exit 0 means PASS, exit 1 means a user-facing check is FAILING, and exit 2 means the helper could not finish. Inspect the transcript before classifying an interrupted drive. Clean up after each attempt.
+Use the drive argument from the [feature map](features/README.md). Exit 0 means PASS, exit 1 means a user-facing check is FAILING, and exit 2 means the helper could not finish. Rerun doctor after a failed drive and inspect the transcript before classifying it. Clean up after each attempt.
 
 The helper runs the coordinator commands as CLI subprocesses in the disposable repository. It runs worker commands as separate CLI subprocesses in the assigned checkout. Runtime handles and session IDs identify shell-role turns. An optional live Claude Code, Codex CLI, or user-started interactive agy coordinator run with Claude Code or Codex workers requires a separate verification pass covering host launch, permissions, notifications or shell-handle polling, and real session resume.
+
+The board and PR follow-up journeys use a local fake `gh` on the sandbox's PATH. The migration journey also creates a separate v4 DB with the historical CLI from the fetched Git history.
 
 ## Evidence
 
@@ -46,7 +48,7 @@ Keep the directory printed by `mktemp`. Record its path and the journey name in 
 - `commands.jsonl` records each command, working directory, stdout, stderr, and exit code.
 - `status.json`, `events.json`, and `messages.json` show the CLI's final view and stored effects. The SQLite dump is read-only.
 - `git-state.json` records worktree placement, branch refs, and file status. Review and delivery journeys also save the Git patches.
-- `verdict.json` shows the checks that determined the outcome. Journeys with diagnostic probes save their outputs as JSON.
+- `verdict.json` shows the checks that determined the outcome. See each recipe for its extra JSON, text, and HTML artifacts.
 
 Use the CLI responses and observed Git effects as the proof. Use the DB event dump to explain what was recorded. Correlate the IDs across actions, events, and final state. Record a failed expected outcome in the feature's Gotchas with the command and observed result.
 
@@ -59,7 +61,7 @@ test -s "$evidence/commands.jsonl"
 test -s "$evidence/cleanup.json"
 ```
 
-The helper deletes its disposable repository, linked worktree, and DB. Keep the separate evidence directory and check that the transcript, verdict, and any required patches survived. The app's `cleanup <run>` command lists delivery candidates. The lifecycle journey checks that list and exercises ordinary Git worktree removal before sandbox teardown.
+The helper deletes its disposable repository, linked worktree, and DB. Keep the separate evidence directory and check that the transcript, verdict, and every journey-specific artifact survived. The app's `cleanup <run>` command lists delivery candidates. The lifecycle journey checks that list and exercises ordinary Git worktree removal before sandbox teardown.
 
 ## Helpers
 

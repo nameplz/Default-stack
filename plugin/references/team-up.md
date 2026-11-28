@@ -14,13 +14,13 @@ Use `claude` or `codex` for new Tasks. agy remains available as an interactive c
 
 Use the local script's `--help` for command arguments. The examples put `--db` before the subcommand. Replace the shell variables and example values with the actual Run values. Replace the example `python3` with the selected executable if you use a different one.
 
-Running `init` upgrades a schema v3 DB to v4 in place; other commands on v3 ask for `init` first. Schema v2 and older DBs still require a new absolute `--db` path to `init`; keep the old DB for its Run history.
+Run `init` to upgrade a schema v3 or v4 DB to v5 in place. For schema v2 and older, run `init` with a new absolute `--db` path. Keep the old DB for its Run history.
 
 ### Existing agy records
 
 agy worker dispatch is no longer supported. Google's [Antigravity Terms of Service §6](https://antigravity.google/terms) and [FAQ](https://antigravity.google/docs/faq) prohibit third-party agent orchestration with consumer sign-in. team-up does not inspect authentication, so it blocks agy workers for all authentication types.
 
-Keep schema v4 and all saved agy Tasks, Dispatches, events, and evidence. team-up blocks new agy Tasks, reservations, retries, turns, answers, and instructions. Automatic reservation skips saved agy Tasks. If the Dispatch is `running` or `turn-ended` and has no recorded runtime, team-up also rejects `register` and `started`. Use `status <run-id>` to inspect Tasks, Dispatches with completion evidence, dependencies, and messages. Use `wait <run-id> --timeout 0` to read unacknowledged `question` and `done` events.
+Schema v5 preserves saved agy Tasks, Dispatches, events, and evidence. team-up blocks new agy Tasks, reservations, retries, turns, answers, and instructions. Automatic reservation skips saved agy Tasks. If the Dispatch is `running` or `turn-ended` and has no recorded runtime, team-up also rejects `register` and `started`. Use `status <run-id>` to inspect Tasks, Dispatches with completion evidence, dependencies, and messages. Use `wait <run-id> --timeout 0` to read unacknowledged `question` and `done` events.
 
 Use `stop <dispatch-id>` to close a reservation that never began. For a begun Dispatch, record `stop` and ask the host to terminate that exact worker if it is still live. Keep the slot and worktree while liveness is unknown, even if the Dispatch has no runtime handle. After confirming shutdown, record `exited <dispatch-id> --turn <turn> --code <exit-code> --stopped`. If the worker exited on its own and no stop was requested, reconcile the actual exit with `exited`. Preserve saved results and follow the usual [delivery and cleanup checks](#deliver-and-clean-up).
 
@@ -96,6 +96,8 @@ Call `begin <dispatch-id>` immediately before starting or resuming the worker. U
 
 Give each worker a filled-in brief. Include the exact commands with concrete paths and IDs.
 
+Use `note <run-id> <text>` as coordinator to record decisions, conventions, and pitfalls that apply across Tasks. Use `status <run-id>` to read all notes. Paste the `notes` text returned by `begin` into the brief for each turn. It contains the latest notes first and marks truncation at 4 KiB.
+
 ```text
 Run: <run ID>
 Task: <task ID>
@@ -103,6 +105,7 @@ Dispatch: <dispatch ID>
 Turn: <turn number>
 Worktree and branch: <absolute worktree path and branch>
 Goal: <deliverable>
+Run notes: <notes from begin>
 Edit only: <paths>
 Verify: <exact commands, one per shell call, and expected evidence>
 Diff: <exact read-only Git commands for the editable paths>
@@ -111,6 +114,7 @@ Python: <selected executable>
 Script: <absolute script path used in the commands>
 
 Run each supplied command in its own shell call from the assigned worktree.
+Report the step count once you have a plan. Send one progress line whenever the step changes.
 Keep the command prefix exactly as supplied. If a required tool call is denied,
 record a question naming the denied tool and path or command. Record any blocking
 question once and end the turn.
@@ -129,10 +133,13 @@ Use the following commands as examples for the brief. Replace the evidence JSON 
 
 ```sh
 /opt/python/bin/python3 /opt/team-up/team_up.py --db /var/tmp/team-up/state.db heartbeat 12 --turn 1
+/opt/python/bin/python3 /opt/team-up/team_up.py --db /var/tmp/team-up/state.db progress 12 --turn 1 --step 1/3 'Inspect the existing migration'
 /opt/python/bin/python3 /opt/team-up/team_up.py --db /var/tmp/team-up/state.db record 12 --turn 1 'Which path should I use?'
 /opt/python/bin/python3 /opt/team-up/team_up.py --db /var/tmp/team-up/state.db done 12 --turn 1 --evidence '{"status":"success","result":"Full result with test output","verification":[{"command":"/usr/bin/python3 -m unittest","exit_code":0,"location":"completion report result"}],"changed_code":true,"diff":"<Git patch output encoded as a JSON string>"}'
 /opt/python/bin/python3 /opt/team-up/team_up.py --db /var/tmp/team-up/state.db done 12 --turn 1 --evidence-file /var/tmp/team-up/evidence-12-t1.json
 ```
+
+Use `progress <dispatch-id> --turn N [--step k/n] <text>` during the active running turn. Use `1 <= k <= n` and at most 200 characters of text. Omit `--step` to keep the reported step and total. Each report refreshes the heartbeat and records a `progress` event. `wait` continues waiting for an actionable event or its timeout. `begin` clears the prior turn's progress.
 
 Use one terminal path per turn. A worker that records a blocking question ends the turn instead of running `done`. Preserve the worker log and Git patch before cleanup.
 
@@ -276,6 +283,27 @@ Use `ask --timeout <seconds>` only when the worker must continue in the same tur
 If the current turn has no runtime handle, `turn-ended` and `exited` warn on stderr and still save the report. This lets you record a confirmed exit after a missed `started`. An `exited --start-failed` report has no runtime warning.
 
 If worker activity is still expected in the Claude desktop app's Code tab, start `wait <run-id> --timeout 30` as a background Bash job and end the turn. The job's completion wakes the coordinator. In an active CLI coordinator, poll with `wait <run-id> --timeout 30` and reconcile after each return. If the CLI coordinator exits, resume its saved session and name the absolute DB path and Run ID in the prompt. Use `claude -p --resume <coordinator-session-id>` for Claude Code CLI. For Codex CLI, follow the [Codex coordinator pickup procedure](#codex-coordinator). For agy, follow the [agy coordinator pickup procedure](#agy-coordinator).
+
+## Follow up on pull requests
+
+1. Record delivery, then register the open PR with `pr-open <dispatch-id> --number <number>`. The default policy is `hold`. Use `--policy manual` when the user plans to merge. A matching glob in the coordinator checkout's `.github/merge-policy` forces `hold`. Put one glob per line and start comment lines with `#`.
+2. Use `wait <run-id> --sync-prs 15` to poll GitHub. Check failures and conflicts wake the coordinator. Read the other PR events on the next wake or timeout. GitHub's merged state records the merge for Tasks that depend on it.
+3. For a failure or conflict, queue an `instruct` on the same Dispatch. If the PR is armed, run `gh pr merge <number> --disable-auto` and then `pr-sync <run-id>`. Call `begin` after the worker exits and a slot frees up. Resume the saved session and publish the reviewed fix. After three fix rounds, bring the remaining failure or conflict to the user. The board puts it under 내 차례.
+4. When the user explicitly approves auto-merge, create a new gate dedicated to that PR, such as `merge-pr-<number>`. Record approval with `gate <run-id> <name> --decision approve`, then run `pr-policy <task-id> auto --gate <name>`. Confirm the target branch requires the `verify` check before using `pr-arm <task-id>`. Use `pr-policy <task-id> hold` or `manual` to record a change in the user's decision. Never merge with `--admin`.
+
+GitHub can merge an armed PR between polls. If other actors can push to an armed PR, enforce paths requiring approval in GitHub branch protection. Use `hold` for merge queues unless GitHub enforces the same policy, since disabling auto-merge does not remove a queued PR.
+
+## Report progress with the board
+
+When you report progress to the user, run `board <run-id>` and show its output as is. It is read-only and places each Task in one group: 내 차례 (unanswered questions, undecided gates, three start failures), 진행 중 (open Dispatches and ready Tasks marked 대기열), 검토 대기, 머지 중, 막힘 (with `←` naming what the Task waits on), and 완료. Lead with the 내 차례 items. Use `board <run-id> --json` when you need the same groups as data, and `status` when you need the raw records.
+
+Running Dispatches show their reported step and text, worktree diff stats, last update time, and a stall marker after 10 minutes without a heartbeat or progress report. The coordinator counts changes against `HEAD` and includes untracked files. Binary files contribute zero lines.
+
+Running entries in `board --json` include `progress_text`, `progress_step`, `progress_total`, and `progress_at`. Unreported values are `null`. `last_update_at` is the latest heartbeat or progress timestamp in UTC, and `stalled` is a boolean. `diff_stats` contains `files`, `added`, and `deleted`, or is `null` when the worktree is unavailable.
+
+Run `board <run-id> --html [<path>] [--watch <seconds>]` and open the file in the app's browser pane. The default path is `boards/run-<run-id>.html` next to the State DB. Omit `--watch` to write the file once.
+
+Use a positive whole number with `--watch` to keep the board current. When every Task is in 완료, the watch stops and leaves a final page without refresh. Ctrl+C stops the watch and saves the current board without refresh. At the end of the Run, report the board path to the user. Delete the file only after the user confirms.
 
 ## Stop or retry
 

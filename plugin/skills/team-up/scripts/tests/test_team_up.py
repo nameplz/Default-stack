@@ -1,8 +1,11 @@
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import closing, redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta, timezone
+from io import StringIO
 from pathlib import Path
+import runpy
 import sqlite3
 import subprocess
 import sys
@@ -10,6 +13,7 @@ from tempfile import TemporaryDirectory
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "team_up.py"
@@ -121,11 +125,13 @@ class TeamUpTest(unittest.TestCase):
         self.db = Path(temp.name) / "state with spaces.db"
         self.command = [sys.executable, "-B", str(SCRIPT), "--db", str(self.db)]
         self.cwd = REPO
+        self.fake_gh = self.db.parent / "fake gh"
 
-    def invoke(self, *args, expected=0, stderr=None):
+    def invoke(self, *args, expected=0, stderr=None, env=None):
         result = subprocess.run(
             [*self.command, *map(str, args)],
-            cwd=self.cwd, capture_output=True, text=True, timeout=30,
+            cwd=self.cwd, env={**os.environ, **(env or {}), "TEAM_UP_GH": str(self.fake_gh)},
+            capture_output=True, text=True, timeout=30,
         )
         self.assertEqual(result.returncode, expected, result.stderr or result.stdout)
         if stderr is not None:
@@ -138,15 +144,18 @@ class TeamUpTest(unittest.TestCase):
         self.invoke("init")
         return self.invoke("run-create", "--goal", "Run goal", "--slots", slots, *options)["id"]
 
-    def create_v3(self):
+    def create_legacy_db(self, version):
         repo_common_dir = subprocess.check_output(
             ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
             cwd=self.cwd, text=True,
         ).strip()
         with sqlite3.connect(self.db) as db:
-            db.executescript(V3_SCHEMA)
+            schema = V3_SCHEMA
+            if version == 4:
+                schema = schema.replace("('claude', 'codex')", "('claude', 'codex', 'agy')")
+            db.executescript(schema)
+            db.execute(f"PRAGMA user_version={version}")
             db.executescript("""
-                PRAGMA user_version=3;
                 PRAGMA foreign_keys=ON;
                 INSERT INTO runs VALUES (7, 'Run goal', 2, 'main', 3);
                 INSERT INTO tasks VALUES
@@ -160,6 +169,8 @@ class TeamUpTest(unittest.TestCase):
                 INSERT INTO messages VALUES (31, 29, 2, 'question', 'Proceed?', 'Yes', 1);
                 INSERT INTO events VALUES (37, 7, 19, 29, 'question', 'recorded', '{}');
             """)
+            if version == 4:
+                db.execute("UPDATE tasks SET worker = 'agy' WHERE id = 11")
             db.execute("INSERT INTO repository VALUES (1, ?)", (str(Path(repo_common_dir).resolve()),))
 
     def task(self, run, goal, *constraints, worker="codex"):
@@ -169,9 +180,8 @@ class TeamUpTest(unittest.TestCase):
         )["id"]
 
     def make_legacy_agy(self, task):
-        # Lifecycle state is identical in v4; restore the old worker identity after setup.
         with closing(sqlite3.connect(self.db)) as db, db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)
             db.execute("UPDATE tasks SET worker = 'agy' WHERE id = ?", (task,))
 
     def assert_legacy_execution_rejected(self, *args, error="worker 'agy' is not supported for new work"):
@@ -229,10 +239,259 @@ class TeamUpTest(unittest.TestCase):
         self.cwd = checkout
         return worktree
 
+    def pr_fixture(self, **overrides):
+        if not self.fake_gh.exists():
+            self.fake_gh.write_text(
+                "#!/usr/bin/python3\n"
+                "import json, os, sys, time\n"
+                "from pathlib import Path\n"
+                "root = Path(__file__).parent\n"
+                "args = sys.argv[1:]\n"
+                "with (root / 'gh.log').open('a') as log:\n"
+                "    print(json.dumps(args), file=log)\n"
+                "if args[:2] == ['pr', 'view']:\n"
+                "    failure = root / 'fail-view'\n"
+                "    if failure.exists():\n"
+                "        failure.unlink()\n"
+                "        sys.exit('temporary GitHub failure')\n"
+                "    time.sleep(float(os.environ.get('TEAM_UP_TEST_GH_SLEEP', '0')))\n"
+                "    print((root / 'pr.json').read_text())\n"
+                "elif args[:2] == ['pr', 'merge'] and '--disable-auto' in args:\n"
+                "    if os.environ.get('TEAM_UP_TEST_GH_FAIL_DISABLE'):\n"
+                "        sys.exit('temporary disarm failure')\n"
+                "    fixture = root / 'pr.json'\n"
+                "    data = json.loads(fixture.read_text())\n"
+                "    data['autoMergeRequest'] = None\n"
+                "    fixture.write_text(json.dumps(data))\n"
+                "elif args[:2] != ['pr', 'merge'] and args[:2] != ['pr', 'update-branch']:\n"
+                "    sys.exit('Unexpected gh command')\n",
+                encoding="utf-8",
+            )
+            self.fake_gh.chmod(0o700)
+        state = {
+            "headRefOid": "a" * 40,
+            "statusCheckRollup": [{"__typename": "CheckRun", "status": "IN_PROGRESS", "conclusion": ""}],
+            "mergeable": "MERGEABLE", "mergeStateStatus": "BLOCKED",
+            "autoMergeRequest": None, "state": "OPEN", "mergeCommit": None,
+            "files": [{"path": "src/example.py"}], "changedFiles": 1, "baseRefName": "main",
+            "url": "https://github.example/owner/repo/pull/42",
+        }
+        (self.db.parent / "pr.json").write_text(json.dumps({**state, **overrides}), encoding="utf-8")
+
+    def gh_writes(self):
+        log = self.db.parent / "gh.log"
+        calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+        return [args for args in calls if args[:2] != ["pr", "view"]]
+
+    def delivered_pr_dispatch(self, slots=2, *run_options):
+        checkout = self.linked_worktree()
+        run = self.run_create(slots, *run_options)
+        task = self.task(run, "Follow the PR")
+        dispatch, turn = self.start(run, task, "--worktree", checkout, "--branch", "assigned")
+        self.report(dispatch, turn)
+        self.exit_worker(dispatch, turn)
+        self.invoke("delivered", dispatch)
+        return run, task, dispatch
+
+    def approve_pr(self, run, task):
+        self.invoke("gate", run, "merge", "--decision", "approve")
+        self.assertEqual(self.invoke("pr-policy", task, "auto", "--gate", "merge")["policy"], "auto")
+
+    def test_slow_pr_sync_leaves_worker_writes_available(self):
+        run, _, dispatch = self.delivered_pr_dispatch()
+        self.pr_fixture()
+        self.invoke("pr-open", dispatch, "--number", 42)
+        worker, turn = self.start(run, self.task(run, "Keep working during sync"))
+        log = self.db.parent / "gh.log"
+        log.unlink()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            sync = pool.submit(self.invoke, "pr-sync", run, env={"TEAM_UP_TEST_GH_SLEEP": "6"})
+            deadline = time.monotonic() + 5
+            while not (log.exists() and log.stat().st_size) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(log.exists() and log.stat().st_size, "fake gh did not start")
+            self.assertEqual(self.invoke("heartbeat", worker, "--turn", turn)["turn"], turn)
+            self.assertFalse(sync.done(), "heartbeat must complete while fake gh is sleeping")
+            sync.result()
+
+    def test_pr_open_tracks_hold_before_disarming_and_can_retry(self):
+        run, _, dispatch = self.delivered_pr_dispatch()
+        self.pr_fixture(autoMergeRequest={"enabledAt": "now"})
+        self.invoke("pr-open", dispatch, "--number", 42, expected=1,
+                    env={"TEAM_UP_TEST_GH_FAIL_DISABLE": "1"})
+        pr = self.invoke("status", run)["pull_requests"][0]
+        self.assertEqual((pr["policy"], pr["auto_merge"]), ("hold", 1))
+        retried = self.invoke("pr-open", dispatch, "--number", 42)
+        self.assertEqual((retried["id"], retried["auto_merge"]), (pr["id"], 0))
+
+    def test_pr_approval_gate_is_dedicated_to_one_pr(self):
+        run, task, dispatch = self.delivered_pr_dispatch()
+        self.pr_fixture()
+        self.invoke("pr-open", dispatch, "--number", 42)
+        other = self.task(run, "Another PR", "--gate", "start-work")
+        self.invoke("gate", run, "start-work", "--decision", "approve")
+        self.invoke("pr-policy", task, "auto", "--gate", "start-work", expected=1)
+        other_dispatch, turn = self.start(run, other)
+        self.report(other_dispatch, turn)
+        self.exit_worker(other_dispatch, turn)
+        self.invoke("delivered", other_dispatch)
+        self.invoke("pr-open", other_dispatch, "--number", 43)
+        self.approve_pr(run, task)
+        self.invoke("pr-policy", task, "hold")
+        self.invoke("pr-policy", other, "auto", "--gate", "merge", expected=1)
+        self.assertEqual(self.invoke("status", run)["pull_requests"][0]["approval_gate"], "merge")
+        self.invoke("task-create", run, "--worker", "codex", "--goal", "Reuse PR gate",
+                    "--scope", "src/", "--evidence", "Show tests", "--gate", "merge", expected=1)
+        self.approve_pr(run, task)
+
+    def test_wait_retries_a_failed_pr_sync(self):
+        run, _, dispatch = self.delivered_pr_dispatch()
+        self.pr_fixture(statusCheckRollup=[{"state": "FAILURE"}])
+        self.invoke("pr-open", dispatch, "--number", 42)
+        self.invoke("ack", run, self.invoke("wait", run, "--timeout", 0)["cursor"])
+        failure = self.db.parent / "fail-view"
+        failure.touch()
+        rejected = self.invoke("pr-sync", run, expected=1)
+        self.assertIn("temporary GitHub failure", rejected.stderr)
+        failure.touch()
+        watched = subprocess.run(
+            [*self.command, "wait", str(run), "--timeout", "10", "--sync-prs", "1"],
+            cwd=self.cwd, env={**os.environ, "TEAM_UP_GH": str(self.fake_gh)},
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(watched.returncode, 0, watched.stderr)
+        self.assertIn("temporary GitHub failure", watched.stderr)
+        self.assertEqual([event["kind"] for event in json.loads(watched.stdout)["events"]], ["pr-checks-failed"])
+
+    def test_pr_arm_requires_auto_policy_and_healthy_checks(self):
+        run, task, dispatch = self.delivered_pr_dispatch()
+        self.pr_fixture()
+        self.invoke("pr-open", dispatch, "--number", 42, "--policy", "auto", expected=1)
+        pr = self.invoke("pr-open", dispatch, "--number", 42)
+        self.assertEqual((pr["policy"], pr["auto_merge"]), ("hold", 0))
+        self.invoke("pr-open", dispatch, "--number", 43, expected=1)
+        self.invoke("pr-arm", task, expected=1)
+        self.invoke("pr-policy", task, "manual")
+        self.invoke("pr-arm", task, expected=1)
+        self.invoke("pr-policy", task, "auto", "--gate", "merge", expected=1)
+        self.assertEqual(self.gh_writes(), [])
+        self.approve_pr(run, task)
+        self.pr_fixture(statusCheckRollup=[{"state": "FAILURE"}])
+        refused = self.invoke("pr-arm", task, expected=1)
+        self.assertIn("failing checks", refused.stderr)
+        self.assertEqual(self.gh_writes(), [])
+        self.pr_fixture()
+        self.assertEqual(self.invoke("pr-arm", task)["auto_merge"], 1)
+        self.assertEqual(self.gh_writes(), [
+            ["pr", "merge", "42", "--auto", "--squash", "--match-head-commit", "a" * 40],
+        ])
+
+    def test_pr_path_policy_downgrades_and_disables_an_armed_pr_on_new_head(self):
+        run, task, dispatch = self.delivered_pr_dispatch()
+        policy = self.cwd / ".github" / "merge-policy"
+        policy.parent.mkdir(exist_ok=True)
+        policy.write_text("# Approval paths\nprotected/**/*.py\nconfig/**/live/**/settings.yml\n", encoding="utf-8")
+        self.pr_fixture(files=[{"path": "protected/direct.py"}])
+        self.assertEqual(self.invoke("pr-open", dispatch, "--number", 42, "--policy", "manual")["policy"], "hold")
+        self.invoke("gate", run, "merge", "--decision", "approve")
+        self.invoke("pr-policy", task, "auto", "--gate", "merge", expected=1)
+        self.pr_fixture()
+        self.assertEqual(self.invoke("pr-sync", run)["pull_requests"][0]["policy"], "hold")
+        self.approve_pr(run, task)
+        self.invoke("pr-arm", task)
+        self.pr_fixture(headRefOid="b" * 40, autoMergeRequest={"enabledAt": "now"},
+                        files=[{"path": "config/live/subdir/settings.yml"}])
+        pr = self.invoke("pr-sync", run)["pull_requests"][0]
+        self.assertEqual((pr["policy"], pr["auto_merge"]), ("hold", 0))
+        self.assertEqual(self.gh_writes()[-1], ["pr", "merge", "42", "--disable-auto"])
+        self.pr_fixture(headRefOid="c" * 40)
+        self.assertEqual(self.invoke("pr-sync", run)["pull_requests"][0]["policy"], "hold")
+        result = self.invoke("wait", run, "--timeout", 0)
+        self.assertEqual([event["kind"] for event in result["events"]].count("pr-policy-downgraded"), 1)
+        self.approve_pr(run, task)
+        self.pr_fixture(headRefOid="d" * 40, changedFiles=101)
+        refused = self.invoke("pr-arm", task, expected=1)
+        self.assertIn("merge-policy", refused.stderr)
+        self.assertEqual(self.invoke("status", run)["pull_requests"][0]["policy"], "hold")
+        self.assertEqual(sum("--auto" in call for call in self.gh_writes()), 1)
+
+    def test_pr_sync_updates_only_auto_and_records_merge_for_dependents(self):
+        run, task, dispatch = self.delivered_pr_dispatch(2, "--base", "origin/main")
+        self.pr_fixture(mergeStateStatus="BEHIND")
+        self.invoke("pr-open", dispatch, "--number", 42)
+        self.invoke("pr-sync", run)
+        self.assertEqual(self.gh_writes(), [])
+        self.approve_pr(run, task)
+        self.invoke("pr-sync", run)
+        self.assertEqual(self.gh_writes(), [["pr", "update-branch", "42"]])
+        dependent = self.task(run, "After the merge", "--after-merge", task)
+        self.assertIsNone(self.invoke("reserve", run, "--task", dependent))
+        sha = "d" * 40
+        self.pr_fixture(state="MERGED", mergeCommit={"oid": sha})
+        self.assertEqual(self.invoke("pr-sync", run)["pull_requests"][0]["merged_commit"], sha)
+        self.assertEqual(self.invoke("pr-sync", run)["pull_requests"], [])
+        current = self.invoke("status", run)["tasks"][0]
+        self.assertEqual((current["merged_base"], current["merged_commit"]), ("origin/main", sha))
+        self.assertEqual(self.invoke("reserve", run, "--task", dependent)["task_id"], dependent)
+        events = self.invoke("wait", run, "--timeout", 0)["events"]
+        self.assertEqual([event["kind"] for event in events].count("pr-merged"), 1)
+
+    def test_pr_wait_and_fix_rounds_require_a_slot_and_stop_after_three(self):
+        run, task, dispatch = self.delivered_pr_dispatch(1)
+        self.pr_fixture(statusCheckRollup=[{"state": "SUCCESS"}])
+        self.invoke("pr-open", dispatch, "--number", 42)
+        self.invoke("ack", run, self.invoke("wait", run, "--timeout", 0)["cursor"])
+        watched = self.invoke("wait", run, "--timeout", 0.1, "--sync-prs", 1)
+        self.assertEqual([event["kind"] for event in watched["events"]], ["pr-checks-passed"])
+        board = self.invoke("board", run, "--json")
+        self.assertEqual(board["groups"][0]["tasks"][0]["fact"], "PR #42 승인 필요")
+        self.invoke("ack", run, watched["cursor"])
+        self.pr_fixture(statusCheckRollup=[{"status": "COMPLETED", "conclusion": "FAILURE"}],
+                        mergeable="CONFLICTING", mergeStateStatus="DIRTY")
+        watched = self.invoke("wait", run, "--timeout", 30, "--sync-prs", 1)
+        self.assertEqual([event["kind"] for event in watched["events"]], ["pr-checks-failed", "pr-conflict"])
+        self.invoke("ack", run, watched["cursor"])
+        self.assertEqual(self.invoke("wait", run, "--timeout", 0, "--sync-prs", 1)["events"], [])
+        other = self.task(run, "Occupy the only slot")
+        occupied = self.invoke("reserve", run, "--task", other)["id"]
+        self.invoke("instruct", dispatch, "Fix the PR")
+        refused = self.invoke("begin", dispatch, expected=1)
+        self.assertIn("no run slot", refused.stderr)
+        self.assertEqual(self.invoke("status", run)["pull_requests"][0]["fix_rounds"], 0)
+        self.invoke("abandon", occupied, "--reason", "Free the slot")
+        for round_number in range(1, 4):
+            turn = self.begin(dispatch)
+            self.assertEqual(self.invoke("status", run)["pull_requests"][0]["fix_rounds"], round_number)
+            self.started(dispatch, turn)
+            self.report(dispatch, turn)
+            self.exit_worker(dispatch, turn)
+            self.invoke("delivered", dispatch)
+            self.invoke("instruct", dispatch, "Fix the PR")
+        refused = self.invoke("begin", dispatch, expected=1)
+        self.assertIn("3 fix rounds", refused.stderr)
+        board = self.invoke("board", run, "--json")
+        self.assertEqual(board["groups"][0]["tasks"][0]["fact"], "수정 3회 · 확인 필요")
+        self.assertEqual(self.gh_writes(), [])
+
+    def test_pr_fix_waits_until_auto_merge_is_disarmed(self):
+        run, task, dispatch = self.delivered_pr_dispatch()
+        self.pr_fixture()
+        self.invoke("pr-open", dispatch, "--number", 42)
+        self.approve_pr(run, task)
+        self.pr_fixture(statusCheckRollup=[{"state": "FAILURE"}], autoMergeRequest={"enabledAt": "now"})
+        self.invoke("pr-sync", run)
+        self.invoke("instruct", dispatch, "Fix checks")
+        refused = self.invoke("begin", dispatch, expected=1)
+        self.assertIn("disable auto-merge", refused.stderr)
+        self.assertEqual(self.invoke("status", run)["pull_requests"][0]["fix_rounds"], 0)
+        self.invoke("pr-policy", task, "hold")
+        self.assertEqual(self.gh_writes(), [["pr", "merge", "42", "--disable-auto"]])
+        self.assertEqual(self.begin(dispatch), 2)
+
     def test_only_init_creates_or_changes_journal(self):
         self.invoke("run-create", "--goal", "Run", "--slots", 1, expected=1)
         self.assertFalse(self.db.exists())
-        self.assertEqual(self.invoke("init")["schema_version"], 4)
+        self.assertEqual(self.invoke("init")["schema_version"], 5)
         with sqlite3.connect(self.db) as db:
             self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
             self.assertEqual(db.execute("PRAGMA journal_mode=DELETE").fetchone()[0], "delete")
@@ -357,16 +616,38 @@ class TeamUpTest(unittest.TestCase):
         self.invoke("gate", run, "rollout", "--decision", "reject", expected=1)
 
     def test_init_upgrades_v3_and_preserves_data_and_foreign_keys(self):
-        self.create_v3()
+        self.assert_init_upgrades_legacy_db(3)
+
+    def test_init_upgrades_v4_and_preserves_data_and_foreign_keys(self):
+        self.assert_init_upgrades_legacy_db(4)
+
+    def assert_init_upgrades_legacy_db(self, version):
+        self.create_legacy_db(version)
+        denied = self.invoke("status", 7, expected=1)
+        self.assertIn("run init with --db pointing", denied.stderr)
         with sqlite3.connect(self.db) as db:
             original_rows = [line for line in db.iterdump() if line.startswith("INSERT INTO ")]
+        upgraded_rows = []
+        for line in original_rows:
+            if line.startswith('INSERT INTO "runs"'):
+                line = line[:-2] + ",0);"
+            elif line.startswith('INSERT INTO "dispatches"'):
+                line = line[:-2] + ",NULL,NULL,NULL,NULL,NULL);"
+            upgraded_rows.append(line)
 
-        self.assertEqual(self.invoke("init")["schema_version"], 4)
+        self.assertEqual(self.invoke("init")["schema_version"], 5)
+        status = self.invoke("status", 7)
+        self.assertEqual(status["run"]["notes_version"], 0)
+        self.assertEqual(status["notes"], [])
+        self.assertEqual(status["pull_requests"], [])
+        self.assertIsNone(status["dispatches"][0]["notes_version"])
+        for field in ("progress_text", "progress_step", "progress_total", "progress_at"):
+            self.assertIsNone(status["dispatches"][0][field])
         with sqlite3.connect(self.db) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
             self.assertIn("tasks_run", [row[1] for row in db.execute("PRAGMA index_list(tasks)")])
-            self.assertEqual([line for line in db.iterdump() if line.startswith("INSERT INTO ")], original_rows)
+            self.assertEqual([line for line in db.iterdump() if line.startswith("INSERT INTO ")], upgraded_rows)
             with self.assertRaises(sqlite3.IntegrityError):
                 db.execute("UPDATE tasks SET worker = 'unknown' WHERE id = 19")
 
@@ -376,9 +657,75 @@ class TeamUpTest(unittest.TestCase):
             expected=2,
         )
         self.assertIn("invalid choice: 'agy'", result.stderr)
-        self.assertEqual(self.invoke("init")["schema_version"], 4)
+        self.assertEqual(self.invoke("init")["schema_version"], 5)
         with sqlite3.connect(self.db) as db:
-            self.assertEqual([line for line in db.iterdump() if line.startswith("INSERT INTO ")], original_rows)
+            self.assertEqual([line for line in db.iterdump() if line.startswith("INSERT INTO ")], upgraded_rows)
+        self.assertEqual(self.invoke("note", 7, "Use the existing checklist")["notes_version"], 1)
+
+    def test_note_appends_to_its_run_and_status_lists_notes_in_order(self):
+        run = self.run_create()
+        other = self.run_create()
+        self.invoke("note", run, "  ", expected=2)
+        self.invoke("note", 999, "Unknown run", expected=1)
+        first = self.invoke("note", run, "Use the system Python")
+        self.invoke("note", other, "Separate run")
+        second = self.invoke("note", run, "Keep notes short\nInclude commands")
+
+        self.assertEqual((first.pop("notes_version"), second.pop("notes_version")), (1, 2))
+        self.assertEqual(first["run_id"], run)
+        self.assertTrue(first["created_at"])
+        self.assertLess(first["id"], second["id"])
+        status = self.invoke("status", run)
+        self.assertEqual(status["run"]["notes_version"], 2)
+        self.assertEqual(status["notes"], [first, second])
+        self.assertEqual([note["text"] for note in status["notes"]],
+                         ["Use the system Python", "Keep notes short\nInclude commands"])
+        self.assertEqual(self.invoke("status", other)["run"]["notes_version"], 1)
+
+    def test_begin_snapshots_notes_per_turn(self):
+        worktree = self.linked_worktree()
+        run = self.run_create()
+        task = self.task(run, "Implement")
+        dispatch = self.invoke("reserve", run, "--task", task,
+                               "--worktree", worktree, "--branch", "assigned")["id"]
+        self.invoke("note", run, "First decision")
+        first = self.invoke("begin", dispatch)
+        self.assertEqual((first["notes_version"], first["notes"]), (1, "First decision"))
+        self.started(dispatch, first["turn"])
+        question = self.invoke("record", dispatch, "--turn", first["turn"], "Which path?")["id"]
+        self.invoke("answer", question, "Use path A")
+        self.exit_worker(dispatch, first["turn"])
+        self.invoke("note", run, "Newest decision")
+
+        status = self.invoke("status", run)
+        self.assertEqual(status["run"]["notes_version"], 2)
+        self.assertEqual(status["dispatches"][0]["notes_version"], 1)
+        second = self.invoke("begin", dispatch)
+        self.assertEqual((second["notes_version"], second["notes"]),
+                         (2, "Newest decision\n\nFirst decision"))
+        with closing(sqlite3.connect(self.db)) as db:
+            events = db.execute(
+                "SELECT data FROM events WHERE dispatch_id = ? AND kind = 'turn-begun' ORDER BY id",
+                (dispatch,),
+            ).fetchall()
+        self.assertEqual([json.loads(data) for (data,) in events],
+                         [{"turn": 1, "notes_version": 1}, {"turn": 2, "notes_version": 2}])
+
+    def test_begin_caps_note_text_in_utf8_bytes(self):
+        run = self.run_create()
+        task = self.task(run, "Use notes in the brief")
+        dispatch = self.invoke("reserve", run, "--task", task)["id"]
+        older = "Older note"
+        newest = "🍋" * 1500
+        self.invoke("note", run, older)
+        self.invoke("note", run, newest)
+
+        brief = self.invoke("begin", dispatch)
+        marker = "\n[Run notes truncated]"
+        self.assertEqual(brief["notes_version"], 2)
+        self.assertEqual(brief["notes"], newest[:(4096 - len(marker)) // 4] + marker)
+        self.assertLessEqual(len(brief["notes"].encode("utf-8")), 4096)
+        self.assertEqual([note["text"] for note in self.invoke("status", run)["notes"]], [older, newest])
 
     def test_active_workers_run_while_legacy_agy_reservations_are_blocked(self):
         run = self.run_create(slots=1)
@@ -520,7 +867,7 @@ class TeamUpTest(unittest.TestCase):
                 self.assertEqual(self.invoke("reserve", run)["task_id"], next_task)
 
     def test_non_init_on_v3_suggests_init_on_the_same_database(self):
-        self.create_v3()
+        self.create_legacy_db(3)
         result = self.invoke("status", 7, expected=1)
         self.assertIn("schema version 3", result.stderr)
         self.assertIn("run init", result.stderr)
@@ -529,7 +876,7 @@ class TeamUpTest(unittest.TestCase):
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
 
     def test_init_rolls_back_v3_upgrade_when_foreign_key_check_fails(self):
-        self.create_v3()
+        self.create_legacy_db(3)
         with sqlite3.connect(self.db) as db:
             db.execute("PRAGMA foreign_keys=OFF")
             db.execute("UPDATE dispatches SET task_id = 99 WHERE id = 29")
@@ -903,10 +1250,11 @@ class TeamUpTest(unittest.TestCase):
         self.report(dispatch, turn, expected=1)
         self.assertEqual(self.invoke("retry", dispatch)["retry_of"], dispatch)
 
-    def test_wait_ignores_heartbeats_and_coordinator_events_until_timeout(self):
+    def test_wait_ignores_heartbeats_progress_and_coordinator_events_until_timeout(self):
         run = self.run_create()
         dispatch, turn = self.start(run, self.task(run, "Keep working"))
         self.invoke("heartbeat", dispatch, "--turn", turn)
+        self.invoke("progress", dispatch, "--turn", turn, "Still working")
         self.invoke("instruct", dispatch, "Coordinator update")
         self.invoke("turn-ended", dispatch, "--turn", turn)
         self.exit_worker(dispatch, turn)
@@ -919,6 +1267,56 @@ class TeamUpTest(unittest.TestCase):
             last_event = db.execute("SELECT max(id) FROM events WHERE run_id = ?", (run,)).fetchone()[0]
         self.assertEqual(observed["cursor"], last_event)
         self.assertEqual(self.invoke("ack", run, observed["cursor"])["cursor"], last_event)
+
+    def test_progress_reports_only_for_the_active_running_turn(self):
+        worktree = self.linked_worktree()
+        run = self.run_create()
+        task = self.task(run, "Report progress")
+        dispatch = self.invoke("reserve", run, "--task", task,
+                               "--worktree", worktree, "--branch", "assigned")["id"]
+        self.invoke("progress", dispatch, "--turn", 1, "Too soon", expected=1)
+        turn = self.begin(dispatch)
+        self.started(dispatch, turn)
+        first = self.invoke("progress", dispatch, "--turn", turn, "Planning")
+        self.assertEqual((first["progress_step"], first["progress_total"]), (None, None))
+        self.invoke("progress", dispatch, "--turn", turn, "--step", "1/3", "Plan ready")
+        report = self.invoke("progress", dispatch, "--turn", turn, "Checking sources")
+        self.assertEqual((report["progress_step"], report["progress_total"]), (1, 3))
+        self.assertEqual(report["progress_at"], report["heartbeat_at"])
+        saved = self.invoke("status", run)["dispatches"][0]
+        with sqlite3.connect(self.db) as db:
+            event = json.loads(db.execute(
+                "SELECT data FROM events WHERE kind = 'progress' AND dispatch_id = ? ORDER BY id DESC LIMIT 1",
+                (dispatch,),
+            ).fetchone()[0])
+        self.assertEqual(event["turn"], turn)
+        for field in ("progress_text", "progress_step", "progress_total", "progress_at", "heartbeat_at"):
+            self.assertEqual(saved[field], report[field])
+            self.assertEqual(event[field], report[field])
+        question = self.invoke("record", dispatch, "--turn", turn, "Proceed?")
+        self.invoke("turn-ended", dispatch, "--turn", turn)
+        self.invoke("progress", dispatch, "--turn", turn, "Too late", expected=1)
+        self.exit_worker(dispatch, turn)
+        self.invoke("progress", dispatch, "--turn", turn, "Waiting", expected=1)
+        self.invoke("answer", question["id"], "Yes")
+        resumed = self.invoke("begin", dispatch)
+        self.assertEqual(resumed["turn"], turn + 1)
+        for field in ("progress_text", "progress_step", "progress_total", "progress_at"):
+            self.assertIsNone(resumed[field])
+        self.invoke("progress", dispatch, "--turn", turn, "Stale", expected=1)
+        self.invoke("progress", dispatch, "--turn", turn + 1, "Resumed")
+
+    def test_progress_validates_step_and_bounds_text(self):
+        run = self.run_create()
+        dispatch, turn = self.start(run, self.task(run, "Report a step"))
+        for step in ("one/two", "1", "1/2/3", "0/2", "2/1", "1/0", "1/9223372036854775808"):
+            with self.subTest(step=step):
+                self.invoke("progress", dispatch, "--turn", turn, "--step=" + step, "Work", expected=2)
+        text = "일" * 200
+        report = self.invoke("progress", dispatch, "--turn", turn, "--step", "2/2", text)
+        self.assertEqual(report["progress_text"], text)
+        self.invoke("progress", dispatch, "--turn", turn, text + "일", expected=1)
+        self.assertEqual(self.invoke("status", run)["dispatches"][0]["progress_text"], text)
 
     def test_wait_wakes_on_done_and_replays_until_acknowledged(self):
         run = self.run_create()
@@ -942,6 +1340,283 @@ class TeamUpTest(unittest.TestCase):
         self.assertGreater(replayed["cursor"], observed["cursor"])
         self.invoke("ack", run, replayed["cursor"])
         self.assertEqual(self.invoke("wait", run, "--timeout", 0), {"events": [], "cursor": replayed["cursor"]})
+
+    def build_board_run(self):
+        run = self.run_create(20)
+        ids = {}
+        ids["ask"] = self.task(run, "Ask the user")
+        dispatch, turn = self.start(run, ids["ask"])
+        self.invoke("record", dispatch, "--turn", turn, "Permission denied: Bash git push")
+        ids["gate"] = self.task(run, "Wait for design gate", "--gate", "design")
+        ids["breaker"] = self.task(run, "Fails to start")
+        dispatch = self.invoke("reserve", run, "--task", ids["breaker"])["id"]
+        for attempt in range(3):
+            self.exit_worker(dispatch, self.begin(dispatch), "--start-failed", code=1)
+            if attempt < 2:
+                dispatch = self.invoke("retry", dispatch)["id"]
+        ids["running"] = self.task(run, "Keep working")
+        self.start(run, ids["running"])
+        ids["ready"] = self.task(run, "Ready to go")
+        ids["review"] = self.task(run, "Needs review", worker="claude")
+        dispatch, turn = self.start(run, ids["review"])
+        self.report(dispatch, turn)
+        self.exit_worker(dispatch, turn)
+        ids["merging"] = self.task(run, "Delivered awaiting merge")
+        dispatch, turn = self.start(run, ids["merging"])
+        self.report(dispatch, turn)
+        self.exit_worker(dispatch, turn)
+        self.invoke("delivered", dispatch)
+        ids["after_merge"] = self.task(run, "Needs the merge", "--after-merge", ids["merging"])
+        ids["after"] = self.task(run, "Needs running task", "--after", ids["running"])
+        ids["rejected"] = self.task(run, "Rejected gate", "--gate", "qa")
+        self.invoke("gate", run, "qa", "--decision", "reject")
+        ids["abandoned"] = self.task(run, "Given up")
+        dispatch = self.invoke("reserve", run, "--task", ids["abandoned"])["id"]
+        self.invoke("abandon", dispatch, "--reason", "Out of scope")
+        ids["delivered"] = self.task(run, "Shipped")
+        dispatch, turn = self.start(run, ids["delivered"])
+        self.report(dispatch, turn)
+        self.exit_worker(dispatch, turn)
+        self.invoke("delivered", dispatch)
+        return run, ids
+
+    def test_board_groups_each_task_once_from_the_users_view(self):
+        run, ids = self.build_board_run()
+        with sqlite3.connect(self.db) as db:
+            before = list(db.iterdump())
+        board = self.invoke("board", run, "--json")
+        with sqlite3.connect(self.db) as db:
+            self.assertEqual(list(db.iterdump()), before)
+        self.assertEqual(set(board), {"run_id", "groups"})
+        groups = {group["key"]: {task["task_id"]: task["fact"] for task in group["tasks"]}
+                  for group in board["groups"]}
+        self.assertEqual([group["key"] for group in board["groups"]],
+                         ["needs_user", "in_progress", "review", "merging", "blocked", "done"])
+        self.assertEqual(groups["needs_user"], {
+            ids["ask"]: "Permission denied: Bash git push",
+            ids["gate"]: "gate design",
+            ids["breaker"]: "시작 실패 3회 · retry --override",
+        })
+        self.assertEqual(set(groups["in_progress"]), {ids["running"], ids["ready"]})
+        self.assertEqual(groups["in_progress"][ids["ready"]], "대기열")
+        self.assertRegex(groups["in_progress"][ids["running"]], r"^\d+(초|분)$")
+        self.assertEqual(list(groups["review"]), [ids["review"]])
+        self.assertEqual(groups["merging"], {ids["merging"]: f"→ #{ids['after_merge']}"})
+        self.assertEqual(groups["blocked"], {
+            ids["after_merge"]: f"← #{ids['merging']} 머지",
+            ids["after"]: f"← #{ids['running']}",
+            ids["rejected"]: "← gate qa",
+        })
+        self.assertEqual(groups["done"], {ids["abandoned"]: "abandoned", ids["delivered"]: "전달됨"})
+        listed = [task for group in groups.values() for task in group]
+        self.assertEqual(sorted(listed), sorted(ids.values()))
+        path = self.db.parent / "board.html"
+        self.assertEqual(self.invoke("board", run, "--html", path), {"path": str(path), "finished": False})
+        html = path.read_text(encoding="utf-8")
+        headings = [f'<h2>{title} <span class="count">{count}</span></h2>'
+                    for title, count in (("내 차례", 3), ("진행 중", 2), ("검토 대기", 1),
+                                         ("머지 중", 1), ("막힘", 3), ("완료", 2))]
+        positions = [html.index(heading) for heading in headings]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn('<span class="count">2/20</span>', html)
+        self.assertIn(f"← #{ids['merging']} 머지", html)
+
+    def test_board_text_lists_nonempty_groups_with_counts(self):
+        run = self.run_create()
+        queued = self.task(run, "First line goal\nsecond line")
+        result = subprocess.run([*self.command, "board", str(run)], cwd=self.cwd,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, f"진행 중 (1)\n  #{queued} codex First line goal  대기열\n")
+        self.invoke("board", 99, expected=1)
+
+    def test_board_html_replaces_the_target_and_escapes_the_goal(self):
+        run = self.run_create()
+        self.task(run, '<script>"a"&\'b\'</script>')
+        directory = self.db.parent / "output with spaces"
+        directory.mkdir()
+        path = directory / "board.html"
+        path.write_text("previous board", encoding="utf-8")
+        with path.open(encoding="utf-8") as previous:
+            self.assertEqual(self.invoke("board", run, "--html", path), {"path": str(path), "finished": False})
+            self.assertEqual(previous.read(), "previous board")
+        self.assertEqual(list(directory.iterdir()), [path])
+        html = path.read_text(encoding="utf-8")
+        self.assertIn("&lt;script&gt;&quot;a&quot;&amp;&#x27;b&#x27;&lt;/script&gt;", html)
+        self.assertNotIn("<script", html)
+        self.assertIn(f"<h1>Run #{run}</h1>", html)
+        self.assertIn('<meta http-equiv="refresh" content="5">', html)
+        self.assertIn('<h2>완료 <span class="count">0</span></h2>\n</section>', html)
+
+    def test_board_html_default_path_and_finished_detection(self):
+        run = self.run_create()
+        path = self.db.resolve().parent / "boards" / f"run-{run}.html"
+        self.assertEqual(self.invoke("board", run, "--html"), {"path": str(path), "finished": False})
+        self.assertIn('<meta http-equiv="refresh" content="5">', path.read_text(encoding="utf-8"))
+
+        dispatch, turn = self.start(run, self.task(run, "Finish the board"))
+        self.assertEqual(self.invoke("board", run, "--html"), {"path": str(path), "finished": False})
+        self.assertIn('<meta http-equiv="refresh" content="5">', path.read_text(encoding="utf-8"))
+
+        self.report(dispatch, turn)
+        self.exit_worker(dispatch, turn)
+        self.invoke("delivered", dispatch)
+        self.assertEqual(self.invoke("board", run, "--html"), {"path": str(path), "finished": True})
+        html = path.read_text(encoding="utf-8")
+        self.assertNotIn('<meta http-equiv="refresh"', html)
+        self.assertIn('<h2>완료 <span class="count">1</span></h2>', html)
+
+    def test_board_watch_requires_html_and_a_positive_interval(self):
+        path = self.db.parent / "board.html"
+        for flags in (("--watch", "1"), ("--json", "--watch", "1"),
+                      ("--json", "--html"), ("--json", "--html", path), ("--html", path, "--watch", "0"),
+                      ("--html", path, "--watch", "-1")):
+            with self.subTest(flags=flags):
+                self.invoke("board", 1, *flags, expected=2)
+        self.assertFalse(path.exists())
+
+    def test_board_watch_stops_when_all_tasks_are_done(self):
+        run = self.run_create()
+        dispatch, turn = self.start(run, self.task(run, "Finish during the watch"))
+        path = self.db.resolve().parent / "boards" / f"run-{run}.html"
+        main = runpy.run_path(str(SCRIPT))["main"]
+        out = StringIO()
+
+        def sleep(seconds):
+            self.assertIn('<meta http-equiv="refresh" content="3">', path.read_text(encoding="utf-8"))
+            self.report(dispatch, turn)
+            self.exit_worker(dispatch, turn)
+            self.invoke("delivered", dispatch)
+
+        with patch("time.sleep", side_effect=sleep), redirect_stdout(out):
+            code = main(["--db", str(self.db), "board", str(run), "--html", "--watch", "3"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue()), {"path": str(path), "finished": True})
+        html = path.read_text(encoding="utf-8")
+        self.assertNotIn('<meta http-equiv="refresh"', html)
+        self.assertIn('<h2>완료 <span class="count">1</span></h2>', html)
+
+    def test_board_watch_reads_fresh_state_and_stops_on_interrupt(self):
+        run = self.run_create()
+        path = self.db.parent / "board.html"
+        main = runpy.run_path(str(SCRIPT))["main"]
+        snapshots = []
+        out = StringIO()
+
+        def sleep(seconds):
+            self.assertEqual(seconds, 3)
+            snapshots.append(path.read_text(encoding="utf-8"))
+            if len(snapshots) == 2:
+                self.task(run, "Arrived before the interrupt")
+                raise KeyboardInterrupt
+            self.task(run, "Arrived during the wait")
+            with closing(sqlite3.connect(self.db, timeout=0)) as db:
+                self.assertEqual(db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0], 0)
+
+        with patch("time.sleep", side_effect=sleep), redirect_stdout(out):
+            code = main(["--db", str(self.db), "board", str(run), "--html", str(path), "--watch", "3"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue()), {"path": str(path), "finished": False})
+        self.assertEqual(len(snapshots), 2)
+        self.assertNotIn("Arrived during the wait", snapshots[0])
+        self.assertIn("Arrived during the wait", snapshots[1])
+        for html in snapshots:
+            self.assertIn('<meta http-equiv="refresh" content="3">', html)
+        final = path.read_text(encoding="utf-8")
+        self.assertIn("Arrived before the interrupt", final)
+        self.assertNotIn('<meta http-equiv="refresh"', final)
+
+    def test_board_watch_reports_a_failed_interrupt_snapshot(self):
+        run = self.run_create()
+        path = self.db.parent / "board.html"
+        main = runpy.run_path(str(SCRIPT))["main"]
+        out, err = StringIO(), StringIO()
+
+        def sleep(seconds):
+            path.unlink()
+            path.mkdir()
+            raise KeyboardInterrupt
+
+        with patch("time.sleep", side_effect=sleep), redirect_stdout(out), redirect_stderr(err):
+            code = main(["--db", str(self.db), "board", str(run), "--html", str(path), "--watch", "3"])
+        self.assertEqual(code, 1)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn(str(path), err.getvalue())
+
+    def test_board_shows_running_progress_and_worktree_diff_stats(self):
+        worktree = self.linked_worktree()
+        run = self.run_create()
+        task = self.task(run, "Implement progress")
+        dispatch, turn = self.start(run, task, "--worktree", worktree, "--branch", "assigned")
+        report = self.invoke("progress", dispatch, "--turn", turn, "--step", "2/3", "Check\nresults")
+
+        def card():
+            return self.invoke("board", run, "--json")["groups"][1]["tasks"][0]
+
+        self.assertEqual(card()["diff_stats"], {"files": 0, "added": 0, "deleted": 0})
+        readme = worktree / "README.md"
+        readme.write_bytes(readme.read_bytes().partition(b"\n")[2])
+        subprocess.run(["git", "add", "README.md"], cwd=worktree, check=True, timeout=30)
+        with readme.open("ab") as file:
+            file.write(b"\nA new line of text.\n")
+        (worktree / "new\tfile\r.txt").write_bytes(b"first\nsecond")
+        (worktree / "binary.dat").write_bytes(b"one\0two\n")
+        (worktree / "empty.txt").touch()
+        running = card()
+        self.assertEqual(running["dispatch_id"], dispatch)
+        self.assertEqual((running["progress_step"], running["progress_total"]), (2, 3))
+        self.assertEqual(running["progress_text"], "Check\nresults")
+        self.assertEqual(running["last_update_at"], report["progress_at"])
+        self.assertFalse(running["stalled"])
+        self.assertEqual(running["diff_stats"], {"files": 4, "added": 4, "deleted": 1})
+        result = subprocess.run([*self.command, "board", str(run)], cwd=self.cwd,
+                                capture_output=True, text=True, timeout=30, check=True)
+        self.assertIn(f"2/3 단계 · Check results · 4개 파일 +4 -1 · {report['progress_at']}", result.stdout)
+        path = self.db.parent / "board.html"
+        self.invoke("progress", dispatch, "--turn", turn, "--step", "2/4", "Check <results>")
+        self.invoke("board", run, "--html", path)
+        html = path.read_text(encoding="utf-8")
+        self.assertIn('<span style="width: 50%"></span>', html)
+        self.assertIn("<span>2/4</span>", html)
+        self.assertIn("Check &lt;results&gt;", html)
+        self.assertIn("<span>4개 파일</span><span>+4 −1</span>", html)
+        worktree.rename(worktree.with_name("moved worktree"))
+        self.assertIsNone(card()["diff_stats"])
+        worktree.mkdir()
+        (worktree / ".git").write_text("gitdir: /missing/worktree\n", encoding="utf-8")
+        self.assertIsNone(card()["diff_stats"])
+
+    def test_board_marks_stalls_using_the_latest_worker_update(self):
+        run = self.run_create()
+        task = self.task(run, "Check a stalled worker")
+        dispatch, turn = self.start(run, task)
+        report = self.invoke("progress", dispatch, "--turn", turn, "Waiting for tests")
+        old = (datetime.now(timezone.utc) - timedelta(minutes=11)).isoformat(timespec="milliseconds")
+
+        def set_times(heartbeat_at, progress_at):
+            with closing(sqlite3.connect(self.db)) as db, db:
+                db.execute("UPDATE dispatches SET heartbeat_at = ?, progress_at = ? WHERE id = ?",
+                           (heartbeat_at, progress_at, dispatch))
+            return self.invoke("board", run, "--json")["groups"][1]["tasks"][0]
+
+        fresh = report["progress_at"]
+        for heartbeat_at, progress_at in ((old, fresh), (fresh, old)):
+            with self.subTest(heartbeat_at=heartbeat_at, progress_at=progress_at):
+                running = set_times(heartbeat_at, progress_at)
+                self.assertFalse(running["stalled"])
+                self.assertEqual(running["last_update_at"], fresh)
+        stalled = set_times(old, old)
+        self.assertTrue(stalled["stalled"])
+        self.assertEqual(stalled["last_update_at"], old)
+        result = subprocess.run([*self.command, "board", str(run)], cwd=self.cwd,
+                                capture_output=True, text=True, timeout=30, check=True)
+        self.assertIn("⚠ 정체 · Waiting for tests", result.stdout)
+        path = self.db.parent / "board.html"
+        self.invoke("board", run, "--html", path)
+        html = path.read_text(encoding="utf-8")
+        updated = datetime.fromisoformat(old).astimezone()
+        self.assertIn(f"<time>{updated:%H:%M:%S}</time>", html)
+        self.assertIn('<article class="stalled">', html)
 
     def test_wait_cursor_preserves_actionable_events_beyond_a_full_batch(self):
         run = self.run_create()

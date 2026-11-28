@@ -1,6 +1,6 @@
 {
   "name": "default-stack",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "Shape a vague idea in casual chat, then set repositories up so checks, not instructions, hold agents to the work and changes auto-merge once verify passes.",
   "author": {
     "name": "nameplz"
