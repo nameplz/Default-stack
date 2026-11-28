@@ -297,7 +297,7 @@ GitHub can merge an armed PR between polls. If other actors can push to an armed
 
 When you report progress to the user, run `board <run-id>` and show its output as is. It is read-only and places each Task in one group: 내 차례 (unanswered questions, undecided gates, three start failures), 진행 중 (open Dispatches and ready Tasks marked 대기열), 검토 대기, 머지 중, 막힘 (with `←` naming what the Task waits on), and 완료. Lead with the 내 차례 items. Use `board <run-id> --json` when you need the same groups as data, and `status` when you need the raw records.
 
-Running Dispatches show their reported step and text, worktree diff stats, last update time, and a stall marker after 10 minutes without a heartbeat or progress report. The coordinator counts changes against `HEAD` and includes untracked files. Binary files contribute zero lines.
+Running Dispatches show their reported step and text, worktree diff stats, last update time, and a stall marker after 30 minutes without a heartbeat or progress report. The coordinator counts changes against `HEAD` and includes untracked files. Binary files contribute zero lines.
 
 Running entries in `board --json` include `progress_text`, `progress_step`, `progress_total`, and `progress_at`. Unreported values are `null`. `last_update_at` is the latest heartbeat or progress timestamp in UTC, and `stalled` is a boolean. `diff_stats` contains `files`, `added`, and `deleted`, or is `null` when the worktree is unavailable.
 

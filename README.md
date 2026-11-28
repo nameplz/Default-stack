@@ -100,7 +100,7 @@ What you see and control:
 
 | Command | Does |
 |---|---|
-| `board <run>` | Tasks grouped as 내 차례, 진행 중, 검토 대기, 머지 중, 막힘, 완료, with worker progress, worktree diff stats, and stalls after 10 minutes. `--json` for data |
+| `board <run>` | Tasks grouped as 내 차례, 진행 중, 검토 대기, 머지 중, 막힘, 완료, with worker progress, worktree diff stats, and stalls after 30 minutes. `--json` for data |
 | `board <run> --html [PATH] [--watch N]` | A self-contained HTML board that refreshes itself. With `--watch`, it rewrites the page every N seconds without the coordinator and leaves a final page when the Run finishes |
 | `progress <dispatch> --turn N [--step k/n] <text>` | A worker reports its plan step. The board updates; the coordinator is not woken |
 | Run notes | Shared notes scoped to one Run, passed to each worker's next turn |
