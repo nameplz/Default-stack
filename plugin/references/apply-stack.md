@@ -46,9 +46,9 @@ Also add these two checks to `verify` when the repository doesn't have them. The
 
 Changes reach the default branch only through pull requests that merge themselves when `verify` passes.
 
-These change GitHub settings. Show the commands and get the user's approval before running them.
+These change GitHub settings. Show the commands and get the user's approval before running them. Do this before the pull request that adds CI, not after it: the required check can be set before the job has ever run, and that pull request's own run of `verify` is the first proof of the gate.
 
-First read what protects the default branch now. Never replace settings that are already there.
+First read what protects the default branch now. Never replace settings that are already there. Also list open pull requests (`gh pr list --state open`): their branches lack the new workflow, so once `verify` is required they cannot merge until they are updated from the default branch. Show that list with the approval request.
 
 ```sh
 gh api repos/<owner>/<repo>/branches/<default>/protection   # classic protection, 404 if none
@@ -66,7 +66,7 @@ Then make one change, depending on what you found:
 
 Then `gh repo edit --enable-auto-merge --delete-branch-on-merge`.
 
-- The context name must match the CI job name, and the job must have run at least once.
+- The context name must match the job name in `.github/workflows/verify.yml` exactly. A mismatched name is never reported, so every pull request waits forever.
 - Confirm afterwards that everything read in the first step is still there and `verify` is now required.
 - If branch protection isn't available (a private repository on a free plan), stop this step and tell the user. Auto-merge without a required check merges immediately.
 
@@ -92,7 +92,7 @@ Keep `AGENTS.md` as the source of truth, with:
   4. at least one recurring mistake blocked by a check, plus boundary and comment checks
   5. auto-merge gated on the required `verify` check
   6. rule-to-enforcement table
-- Don't commit. Show the changed files. Suggest `ship-it` to deliver them.
+- Don't commit. Show the changed files. Suggest `ship-it` to deliver them. That pull request's CI run is the first run of `verify` under the required check; confirm it passes there.
 
 ## Don't
 
