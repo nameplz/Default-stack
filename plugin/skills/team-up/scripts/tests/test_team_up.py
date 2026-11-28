@@ -1591,7 +1591,7 @@ class TeamUpTest(unittest.TestCase):
         task = self.task(run, "Check a stalled worker")
         dispatch, turn = self.start(run, task)
         report = self.invoke("progress", dispatch, "--turn", turn, "Waiting for tests")
-        old = (datetime.now(timezone.utc) - timedelta(minutes=11)).isoformat(timespec="milliseconds")
+        old = (datetime.now(timezone.utc) - timedelta(minutes=31)).isoformat(timespec="milliseconds")
 
         def set_times(heartbeat_at, progress_at):
             with closing(sqlite3.connect(self.db)) as db, db:
